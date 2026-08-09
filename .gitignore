@@ -1,0 +1,10 @@
+.streamlit/secrets.toml
+service_account.json
+*.xlsx
+*.xls
+*.csv
+*.pdf
+.DS_Store
+__pycache__/
+*.pyc
+.env
