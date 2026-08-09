@@ -1582,6 +1582,8 @@ def comparison_trend_figure(
     title,
     unit,
     show_team_average=False,
+    show_selected_average=False,
+    team_average_exclude_keys=None,
     criteria=None,
     restrict_player_teams=None,
     legend_mode="auto",
@@ -1601,7 +1603,7 @@ def comparison_trend_figure(
     if legend_mode == "all":
         show_player_legend = True
         show_average_legend = True
-    elif legend_mode == "team averages":
+    elif legend_mode in {"averages", "team averages"}:
         show_player_legend = False
         show_average_legend = True
     elif legend_mode == "off":
@@ -1638,8 +1640,9 @@ def comparison_trend_figure(
         plotted += 1
 
     if show_team_average:
-        # Team means use ALL eligible position players on that team, regardless of
-        # which athletes are selected for the individual comparison traces.
+        # Team means use the full eligible position-player roster for each selected
+        # team, except athletes explicitly removed from the average because of bad data.
+        excluded_from_team_avg = set(team_average_exclude_keys or [])
         avg_team_values = list(teams or [])
         if not avg_team_values:
             if player_keys:
@@ -1651,6 +1654,9 @@ def comparison_trend_figure(
         avg_teams = ordered_teams(avg_team_values)
         for team_idx, team in enumerate(avg_teams):
             team_keys = eligible_player_keys(bundle, start, end, [team], selected_keys=None)
+            team_keys = [k for k in team_keys if k not in excluded_from_team_avg]
+            if not team_keys:
+                continue
             th = history[
                 history["date"].between(start, end)
                 & history["player_key"].isin(team_keys)
@@ -1680,6 +1686,39 @@ def comparison_trend_figure(
             ))
             plotted += 1
 
+    if show_selected_average and player_keys:
+        # Selected-player mean follows the individual player selector exactly. This is
+        # intentionally separate from team averages so the user can compare a curated
+        # subgroup against the full team (or against a team with bad-data exclusions).
+        sh = history[
+            history["date"].between(start, end)
+            & history["player_key"].isin(list(player_keys))
+        ].copy()
+        if restrict_player_teams:
+            sh = sh[sh["team"].isin(list(restrict_player_teams))].copy()
+        sh = _trend_rows_for_metric(sh, metric)
+        if not sh.empty:
+            selected_daily = (
+                sh.groupby("date", as_index=False)[metric]
+                  .mean()
+                  .sort_values("date")
+            )
+            fig.add_trace(go.Scatter(
+                x=selected_daily["date"],
+                y=selected_daily[metric],
+                mode="lines",
+                name="SELECTED PLAYERS AVG",
+                line=dict(color=C_PURPLE, width=3.6, dash="dot"),
+                opacity=0.98,
+                connectgaps=False,
+                showlegend=show_average_legend,
+                hovertemplate=(
+                    f"<b>Selected players average</b><br>"
+                    f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>"
+                ),
+            ))
+            plotted += 1
+
     if metric == "acwr":
         criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
         refs = []
@@ -1703,19 +1742,46 @@ def comparison_trend_figure(
         return empty_figure(title)
 
     y_title = unit if unit != "#" else "Count"
-    # Keep the legend completely away from the title/plot. In Auto mode, large
-    # team views hide individual legend entries and retain only team averages;
-    # every individual line is still identified on hover.
+    # The chart title is rendered by Streamlit OUTSIDE Plotly so it can never
+    # collide with a wrapped legend. For a large explicit "All" legend, move
+    # names into a vertical rail on the right; smaller legends stay below.
     legend_all_large = legend_mode == "all" and player_count > 8
+    if legend_all_large:
+        legend_cfg = dict(
+            orientation="v",
+            yanchor="top",
+            y=1.0,
+            xanchor="left",
+            x=1.01,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=10),
+            title=None,
+        )
+        chart_margin = dict(l=54, r=235, t=18, b=58)
+        chart_height = 610
+    else:
+        legend_cfg = dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.13,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=10),
+            title=None,
+        )
+        chart_margin = dict(l=54, r=28, t=18, b=105)
+        chart_height = 590
+
+    # Build one layout dictionary and override shared defaults there. Passing
+    # **PLOT_LAYOUT plus a second hovermode keyword raises a Python TypeError
+    # because PLOT_LAYOUT already defines hovermode.
     comparison_layout = {
         **PLOT_LAYOUT,
-        "margin": dict(l=54, r=28, t=72, b=150 if legend_all_large else 92),
-    }
-    fig.update_layout(
-        **comparison_layout,
-        height=650 if legend_all_large else 590,
-        title=dict(text=title, x=0, xanchor="left", font=dict(size=18, color=C_TEXT)),
-        xaxis=dict(
+        "margin": chart_margin,
+        "height": chart_height,
+        "title": None,
+        "xaxis": dict(
             showgrid=False,
             zeroline=False,
             showline=True,
@@ -1724,7 +1790,7 @@ def comparison_trend_figure(
             tickformat="%b %d",
             title=None,
         ),
-        yaxis=dict(
+        "yaxis": dict(
             showgrid=True,
             gridcolor="#E9EEF5",
             gridwidth=1,
@@ -1732,19 +1798,11 @@ def comparison_trend_figure(
             showline=False,
             title=y_title,
         ),
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.16,
-            xanchor="left",
-            x=0,
-            bgcolor="rgba(0,0,0,0)",
-            font=dict(size=10),
-            title=None,
-        ),
-        hovermode="x unified" if player_count <= 8 else "closest",
-        showlegend=(show_player_legend or show_average_legend),
-    )
+        "legend": legend_cfg,
+        "hovermode": "x unified" if player_count <= 8 else "closest",
+        "showlegend": (show_player_legend or show_average_legend),
+    }
+    fig.update_layout(**comparison_layout)
     return fig
 
 
@@ -2520,7 +2578,7 @@ with player_tab:
         key=f"trend_players_flexible_{player_seed_key}_v2",
         help=(
             "Remove players from the selected team(s), or search and add players from any other "
-            "approved team. Team averages are unaffected by individual player filtering."
+            "approved team. Use the separate bad-data exclusion control below to change team-average membership."
         ),
         placeholder="Search any position player",
     )
@@ -2535,30 +2593,62 @@ with player_tab:
             index=metric_keys.index("combined_total_distance_m")
             if "combined_total_distance_m" in metric_keys else 0,
             format_func=lambda m: metric_lookup[m][0],
-            key="trend_metric_flexible_v2",
+            key="trend_metric_flexible_v3",
         )
     with legend_col:
         legend_mode_label = st.selectbox(
             "Legend",
-            options=["Auto", "All", "Team averages only", "Off"],
+            options=["Auto", "All", "Averages only", "Off"],
             index=0,
-            key="trend_legend_mode_v2",
+            key="trend_legend_mode_v3",
             help=(
                 "Auto shows individual names for smaller comparisons. For large team views it "
-                "shows only team-average legend entries; hover any line to identify the player."
+                "shows only average-line legend entries; hover any line to identify the player."
             ),
         )
     trend_title, trend_unit, _ = metric_lookup[metric]
     legend_mode = {
         "Auto": "auto",
         "All": "all",
-        "Team averages only": "team averages",
+        "Averages only": "averages",
         "Off": "off",
     }[legend_mode_label]
 
-    show_team_average = bool(trend_selected_teams)
+    avg_default = "Team average" if trend_selected_teams else "Selected player average"
+    average_mode = st.radio(
+        "Average line",
+        options=["Team average", "Selected player average", "Both", "None"],
+        index=["Team average", "Selected player average", "Both", "None"].index(avg_default),
+        horizontal=True,
+        key=f"trend_average_mode_{player_seed_key}_v3",
+        help=(
+            "Team average uses the selected team roster after any bad-data exclusions below. "
+            "Selected player average uses only the players currently selected in 'Players shown on chart'."
+        ),
+    )
+
+    show_team_average = average_mode in {"Team average", "Both"} and bool(trend_selected_teams)
+    show_selected_average = average_mode in {"Selected player average", "Both"}
     trend_teams = list(trend_selected_teams)
     restrict_player_teams = None  # selected individuals may come from ANY approved team
+
+    team_average_exclude = []
+    if show_team_average and seeded_players:
+        team_average_exclude = st.multiselect(
+            "Exclude from team average (bad data)",
+            options=seeded_players,
+            default=[],
+            format_func=lambda k: (
+                f"{display_map.get(k, k)} · {roster_team_map.get(k, '')}"
+                if roster_team_map.get(k, "") else display_map.get(k, k)
+            ),
+            key=f"trend_team_avg_exclude_{player_seed_key}_v3",
+            help=(
+                "These players can remain visible as individual lines, but their values will not "
+                "be used when calculating the selected team average(s). Use this for bad GPS data."
+            ),
+            placeholder="Exclude bad-data players from the team average",
+        )
 
     if trend_selected_teams:
         chart_title = (
@@ -2571,16 +2661,28 @@ with player_tab:
 
     outside_seed_count = len(set(trend_players) - set(seeded_players))
     hidden_seed_count = len(set(seeded_players) - set(trend_players))
+    average_bits = []
+    if show_team_average:
+        average_bits.append(
+            f"{len(trend_selected_teams)} team average(s) ({len(team_average_exclude)} player(s) excluded)"
+        )
+    if show_selected_average:
+        average_bits.append("selected-player average")
+    average_text = " + ".join(average_bits) if average_bits else "no average line"
     st.markdown(
         f'<div class="gps-subtle"><strong>{len(trend_players)} individual line(s)</strong> · '
-        f'{len(trend_selected_teams)} team average(s) · '
+        f'{average_text} · '
         f'{hidden_seed_count} seeded player(s) hidden · {outside_seed_count} cross-team player(s) added</div>',
         unsafe_allow_html=True,
     )
 
-    if not trend_players and not show_team_average:
+    has_selected_average = bool(show_selected_average and trend_players)
+    if not trend_players and not show_team_average and not has_selected_average:
         st.info("Select a team above or choose one or more players to compare.")
     else:
+        # Keep the title outside the Plotly canvas. This prevents long/wrapped
+        # legends from ever drawing over the title.
+        st.markdown(f"### {chart_title}")
         st.plotly_chart(
             comparison_trend_figure(
                 bundle,
@@ -2592,6 +2694,8 @@ with player_tab:
                 chart_title,
                 trend_unit,
                 show_team_average=show_team_average,
+                show_selected_average=show_selected_average,
+                team_average_exclude_keys=team_average_exclude,
                 criteria=flag_criteria,
                 restrict_player_teams=restrict_player_teams,
                 legend_mode=legend_mode,
