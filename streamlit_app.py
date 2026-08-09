@@ -1126,6 +1126,17 @@ def ordered_teams(values) -> list[str]:
     return vals
 
 
+def is_pitcher_position(value) -> bool:
+    """Return True for roster positions labeled P or Pitcher.
+
+    Token-based matching also excludes combined labels such as "P/1B" while
+    avoiding accidental matches inside unrelated position names.
+    """
+    text = re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+    tokens = set(text.split())
+    return "P" in tokens or "PITCHER" in tokens
+
+
 def eligible_player_keys(bundle, start_date, end_date, teams, selected_keys=None):
     daily = bundle["daily"].copy()
     roster = bundle["roster"].copy()
@@ -1141,6 +1152,15 @@ def eligible_player_keys(bundle, start_date, end_date, teams, selected_keys=None
     # Include current roster players for selected teams so no-data athletes can still appear.
     if teams and not roster.empty:
         keys |= set(roster.loc[roster["roster_team"].isin(teams), "player_key"].dropna())
+
+    # Position-player dashboard: exclude anyone whose roster position is labeled
+    # "P" or "Pitcher". This removes them from player selectors, tables,
+    # charts, flags, team summaries, and generated PDFs.
+    if not roster.empty and "position" in roster.columns:
+        pitcher_keys = set(
+            roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+        )
+        keys -= pitcher_keys
 
     if selected_keys:
         keys &= set(selected_keys)
