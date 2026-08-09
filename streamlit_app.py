@@ -1527,7 +1527,7 @@ PLOT_LAYOUT = dict(
     font=dict(family="Inter, Arial, sans-serif", color=C_TEXT, size=12),
     margin=dict(l=54, r=24, t=58, b=44),
     hoverlabel=dict(bgcolor="white", bordercolor=C_BORDER, font_size=12),
-    hovermode="x unified",
+    hovermode="closest",
 )
 
 # Restrained comparison palette. Lines carry the information; markers are intentionally
@@ -1758,6 +1758,7 @@ def comparison_trend_figure(
             borderwidth=0,
             font=dict(size=10, color=C_MUTED),
             itemsizing="constant",
+            title=dict(text=""),
         )
         chart_margin = dict(l=62, r=225, t=18, b=54)
     else:
@@ -1772,6 +1773,7 @@ def comparison_trend_figure(
             borderwidth=0,
             font=dict(size=10, color=C_MUTED),
             itemsizing="constant",
+            title=dict(text=""),
         )
         chart_margin = dict(l=62, r=24, t=34, b=54)
 
@@ -1781,7 +1783,8 @@ def comparison_trend_figure(
         **PLOT_LAYOUT,
         "height": 470,
         "margin": chart_margin,
-        "title": None,
+        # Explicit empty title avoids Plotly/Streamlit rendering a JS undefined title.
+        "title": dict(text=""),
         "hovermode": "closest",
         "showlegend": (show_player_legend or show_average_legend),
         "legend": legend_cfg,
@@ -1793,7 +1796,10 @@ def comparison_trend_figure(
             linewidth=1,
             tickformat="%b %d",
             tickfont=dict(size=11, color=C_MUTED),
-            title=None,
+            title=dict(text=""),
+            # Plotly 6 can surface the literal word "undefined" from an unset
+            # unified-hover title in some Streamlit builds. Set it explicitly.
+            unifiedhovertitle=dict(text="%{x|%b %d}"),
             fixedrange=False,
         ),
         "yaxis": dict(
