@@ -1583,6 +1583,8 @@ def comparison_trend_figure(
     unit,
     show_team_average=False,
     criteria=None,
+    restrict_player_teams=None,
+    show_legend=True,
 ):
     """Compare multiple players on one clean trend chart with optional team means."""
     history = bundle.get("history_calendar", pd.DataFrame())
@@ -1599,6 +1601,8 @@ def comparison_trend_figure(
         p = history[
             history["date"].between(start, end) & history["player_key"].eq(key)
         ].copy()
+        if restrict_player_teams:
+            p = p[p["team"].isin(list(restrict_player_teams))].copy()
         p = _trend_rows_for_metric(p, metric)
         if p.empty:
             continue
@@ -1608,7 +1612,8 @@ def comparison_trend_figure(
             y=p[metric],
             mode="lines",
             name=display.get(key, key),
-            line=dict(color=color, width=2.6),
+            line=dict(color=color, width=1.9),
+            opacity=0.82,
             connectgaps=False,
             hovertemplate=(
                 f"<b>{display.get(key, key)}</b><br>"
@@ -1632,7 +1637,9 @@ def comparison_trend_figure(
         for team_idx, team in enumerate(avg_teams):
             team_keys = eligible_player_keys(bundle, start, end, [team], selected_keys=None)
             th = history[
-                history["date"].between(start, end) & history["player_key"].isin(team_keys)
+                history["date"].between(start, end)
+                & history["player_key"].isin(team_keys)
+                & history["team"].eq(team)
             ].copy()
             th = _trend_rows_for_metric(th, metric)
             if th.empty:
@@ -1646,9 +1653,9 @@ def comparison_trend_figure(
                 x=team_daily["date"],
                 y=team_daily[metric],
                 mode="lines",
-                name=f"{team} team avg",
-                line=dict(color=C_GRAY, width=3.2, dash="dash"),
-                opacity=max(0.55, 0.92 - team_idx * 0.08),
+                name=f"{team} TEAM AVG",
+                line=dict(color=C_TEXT, width=4.2),
+                opacity=max(0.72, 1.0 - team_idx * 0.06),
                 connectgaps=False,
                 hovertemplate=(
                     f"<b>{team} team average</b><br>"
@@ -1682,7 +1689,7 @@ def comparison_trend_figure(
     y_title = unit if unit != "#" else "Count"
     fig.update_layout(
         **PLOT_LAYOUT,
-        height=500,
+        height=560,
         title=dict(text=title, x=0, font=dict(size=18, color=C_TEXT)),
         xaxis=dict(
             showgrid=False,
@@ -1709,6 +1716,7 @@ def comparison_trend_figure(
             bgcolor="rgba(0,0,0,0)",
             font=dict(size=11),
         ),
+        showlegend=show_legend,
     )
     return fig
 
@@ -2411,46 +2419,122 @@ with overview_tab:
     )
 
 with player_tab:
-    st.subheader("Player Comparison")
+    st.subheader("Trend Comparison")
     st.caption(
-        "Compare multiple position players on the same line chart. Team average uses every "
-        "eligible position player who participated in that team's practice on each date."
+        "Start with no teams selected. Click one or more team names to show every eligible "
+        "position player on those teams plus a team-average line. Leave Teams blank to compare "
+        "specific players instead."
     )
 
-    comparison_options = sorted(keys, key=lambda k: display_map.get(k, k))
-    sidebar_selected_in_scope = [k for k in (selected_players or []) if k in comparison_options]
-    default_comparison = sidebar_selected_in_scope[:6]
-    if not default_comparison and comparison_options:
-        default_comparison = comparison_options[:1]
+    # Player Trends is intentionally independent of the sidebar team/player filters.
+    # This avoids having to deselect the organization-level filters just to inspect a team.
+    trend_team_options = []
+    for team in TEAM_ORDER:
+        if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None):
+            trend_team_options.append(team)
 
-    control_a, control_b = st.columns([2.2, 1])
-    with control_a:
-        trend_players = st.multiselect(
-            "Players to compare",
-            options=comparison_options,
-            default=default_comparison,
-            format_func=lambda k: display_map.get(k, k),
-            help="Select as many players as you want. For readability, 2–6 is usually best.",
-        )
-    with control_b:
-        show_team_average = st.checkbox(
-            "Show whole-team average",
-            value=False,
-            help="Uses all eligible position players on the selected team(s), not just the players above.",
+    # Use clickable team pills when the installed Streamlit version supports them.
+    # A multiselect fallback keeps the app compatible with older Streamlit builds.
+    if hasattr(st, "pills"):
+        trend_selected_teams = st.pills(
+            "Teams",
+            options=trend_team_options,
+            selection_mode="multi",
+            default=[],
+            key="trend_team_pills_none_default_v1",
+            help="Nothing is selected by default. Select any team(s) to load all players and team averages.",
+        ) or []
+    else:
+        trend_selected_teams = st.multiselect(
+            "Teams",
+            options=trend_team_options,
+            default=[],
+            key="trend_team_multiselect_none_default_v1",
+            placeholder="Select team(s)",
+            help="Nothing is selected by default. Select any team(s) to load all players and team averages.",
         )
 
     metric_lookup = {metric: (title, unit, agg) for metric, title, unit, agg in TREND_METRICS}
     metric_keys = list(metric_lookup)
-    metric = st.selectbox(
-        "Metric",
-        options=metric_keys,
-        index=metric_keys.index("combined_total_distance_m") if "combined_total_distance_m" in metric_keys else 0,
-        format_func=lambda m: metric_lookup[m][0],
-    )
+    metric_col, legend_col = st.columns([2.4, 1])
+    with metric_col:
+        metric = st.selectbox(
+            "Metric",
+            options=metric_keys,
+            index=metric_keys.index("combined_total_distance_m")
+            if "combined_total_distance_m" in metric_keys else 0,
+            format_func=lambda m: metric_lookup[m][0],
+            key="trend_metric",
+        )
+    with legend_col:
+        show_trend_legend = st.checkbox(
+            "Show player legend",
+            value=True,
+            key="trend_show_legend",
+        )
     trend_title, trend_unit, _ = metric_lookup[metric]
 
+    # Team mode: selecting any team automatically includes every eligible player
+    # on that team and overlays one team-average line per selected team.
+    if trend_selected_teams:
+        trend_players = []
+        for team in trend_selected_teams:
+            trend_players.extend(
+                eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
+            )
+        trend_players = sorted(
+            set(trend_players), key=lambda k: display_map.get(k, k)
+        )
+        trend_teams = list(trend_selected_teams)
+        show_team_average = True
+        restrict_player_teams = list(trend_selected_teams)
+        chart_title = (
+            f"{' + '.join(trend_selected_teams)} — {trend_title}"
+            if len(trend_selected_teams) <= 3
+            else f"Selected Teams — {trend_title}"
+        )
+        st.markdown(
+            f'<div class="gps-subtle"><strong>{len(trend_players)} players</strong> · '
+            f'{len(trend_selected_teams)} team(s) · all individual lines + team average(s)</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # Custom-player mode only appears when no team is selected. Nothing is
+        # preselected, so the trend tab always opens clean.
+        trend_scope_keys = eligible_player_keys(
+            bundle, start_date, end_date, TEAM_ORDER, selected_keys=None
+        )
+        comparison_options = sorted(
+            trend_scope_keys, key=lambda k: display_map.get(k, k)
+        )
+        trend_players = st.multiselect(
+            "Players to compare",
+            options=comparison_options,
+            default=[],
+            format_func=lambda k: display_map.get(k, k),
+            help="Select any players across the approved teams. Every player gets a separate line.",
+            key="trend_custom_players_none_default_v1",
+            placeholder="Select player(s)",
+        )
+        show_team_average = st.checkbox(
+            "Add their team average(s)",
+            value=False,
+            key="trend_custom_team_average_v2",
+        )
+        if show_team_average and trend_players:
+            history = bundle.get("history_calendar", pd.DataFrame())
+            trend_teams = ordered_teams(
+                history.loc[history["player_key"].isin(trend_players), "team"]
+                .dropna()
+                .unique()
+            ) if history is not None and not history.empty else []
+        else:
+            trend_teams = []
+        restrict_player_teams = None
+        chart_title = f"Player Comparison — {trend_title}"
+
     if not trend_players and not show_team_average:
-        st.info("Select at least one player or turn on the whole-team average.")
+        st.info("Select a team above or choose one or more players to compare.")
     else:
         st.plotly_chart(
             comparison_trend_figure(
@@ -2458,12 +2542,14 @@ with player_tab:
                 start_date,
                 end_date,
                 trend_players,
-                teams,
+                trend_teams,
                 metric,
-                trend_title,
+                chart_title,
                 trend_unit,
                 show_team_average=show_team_average,
                 criteria=flag_criteria,
+                restrict_player_teams=restrict_player_teams,
+                show_legend=show_trend_legend,
             ),
             use_container_width=True,
             config={
@@ -2473,6 +2559,7 @@ with player_tab:
             },
         )
 
+    # Keep the selected athlete rows visible under the plot for quick auditing.
     if trend_players:
         comparison_status = build_status_table(
             bundle, end_date, trend_players, criteria=flag_criteria
@@ -2485,7 +2572,7 @@ with player_tab:
                 compact,
                 use_container_width=True,
                 hide_index=True,
-                height=min(320, 38 + 36 * len(compact)),
+                height=min(420, 38 + 36 * len(compact)),
             )
 
 with summary_tab:
