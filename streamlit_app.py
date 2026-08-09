@@ -1755,10 +1755,11 @@ def comparison_trend_figure(
             x=1.01,
             bgcolor="rgba(0,0,0,0)",
             font=dict(size=10),
-            title=None,
+            title=dict(text=""),
+            itemsizing="constant",
         )
         chart_margin = dict(l=54, r=235, t=18, b=58)
-        chart_height = 610
+        chart_height = 560
     else:
         legend_cfg = dict(
             orientation="h",
@@ -1768,10 +1769,11 @@ def comparison_trend_figure(
             x=0,
             bgcolor="rgba(0,0,0,0)",
             font=dict(size=10),
-            title=None,
+            title=dict(text=""),
+            itemsizing="constant",
         )
         chart_margin = dict(l=54, r=28, t=18, b=105)
-        chart_height = 590
+        chart_height = 545
 
     # Build one layout dictionary and override shared defaults there. Passing
     # **PLOT_LAYOUT plus a second hovermode keyword raises a Python TypeError
@@ -2091,6 +2093,30 @@ st.markdown(
           border-radius: 5px;
       }}
       .gps-subtle {{color: {C_MUTED}; font-size: 0.9rem; margin-bottom: 0.4rem;}}
+      .trend-chart-header {{
+          display: flex;
+          align-items: baseline;
+          gap: 0.55rem;
+          margin: 0.85rem 0 0.10rem 0;
+          padding: 0 0 0.55rem 0;
+          border-bottom: 1px solid {C_BORDER};
+      }}
+      .trend-chart-team {{
+          color: {C_TEXT};
+          font-size: 1.18rem;
+          font-weight: 700;
+          letter-spacing: -0.018em;
+      }}
+      .trend-chart-sep {{
+          color: {C_BORDER};
+          font-size: 1rem;
+          font-weight: 400;
+      }}
+      .trend-chart-metric {{
+          color: {C_MUTED};
+          font-size: 1.00rem;
+          font-weight: 500;
+      }}
       .gps-badge {{
           display: inline-block;
           padding: 0.18rem 0.48rem;
@@ -2651,13 +2677,11 @@ with player_tab:
         )
 
     if trend_selected_teams:
-        chart_title = (
-            f"{' + '.join(trend_selected_teams)} + custom players — {trend_title}"
-            if len(trend_selected_teams) <= 3
-            else f"Selected team averages + custom players — {trend_title}"
-        )
+        chart_context = " + ".join(trend_selected_teams) if len(trend_selected_teams) <= 3 else "Selected teams"
+        chart_title = f"{chart_context} — {trend_title}"
     else:
-        chart_title = f"Player Comparison — {trend_title}"
+        chart_context = "Player comparison"
+        chart_title = trend_title
 
     outside_seed_count = len(set(trend_players) - set(seeded_players))
     hidden_seed_count = len(set(seeded_players) - set(trend_players))
@@ -2680,9 +2704,16 @@ with player_tab:
     if not trend_players and not show_team_average and not has_selected_average:
         st.info("Select a team above or choose one or more players to compare.")
     else:
-        # Keep the title outside the Plotly canvas. This prevents long/wrapped
-        # legends from ever drawing over the title.
-        st.markdown(f"### {chart_title}")
+        # Compact header stays outside Plotly so it cannot collide with the legend.
+        # Keep the visual hierarchy restrained: context first, metric second.
+        st.markdown(
+            f'<div class="trend-chart-header">'
+            f'<span class="trend-chart-team">{chart_context}</span>'
+            f'<span class="trend-chart-sep">/</span>'
+            f'<span class="trend-chart-metric">{trend_title}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
         st.plotly_chart(
             comparison_trend_figure(
                 bundle,
