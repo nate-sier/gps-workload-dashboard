@@ -144,13 +144,14 @@ TEAM_PATTERNS = [
     ("Rochester", re.compile(r"\brochester\b", re.I)),
     ("Rehab", re.compile(r"\brehab\b|rehabilitation", re.I)),
     ("Washington", re.compile(r"\bwashington\b|\bmlb\b|nationals", re.I)),
-    ("Draft", re.compile(r"\bdraft\b", re.I)),
 ]
 
+# Only these teams are available anywhere in the dashboard.
 TEAM_ORDER = [
     "DSL", "FCL", "Fredericksburg", "Wilmington", "Harrisburg",
-    "Rochester", "Rehab", "Washington", "Draft",
+    "Rochester", "Washington", "Rehab",
 ]
+ALLOWED_TEAMS = set(TEAM_ORDER)
 
 STATUS_ORDER = {
     "Review": 0,
@@ -244,7 +245,6 @@ def clean_team(value) -> str:
         "harrisburg": "Harrisburg",
         "rochester": "Rochester",
         "washington": "Washington",
-        "draft": "Draft",
     }
     return lookup.get(key, text)
 
@@ -1121,7 +1121,8 @@ def available_date_bounds(bundle=None):
 
 def ordered_teams(values) -> list[str]:
     vals = [clean_team(v) for v in values if clean_team(v)]
-    vals = sorted(set(vals), key=lambda x: (TEAM_ORDER.index(x) if x in TEAM_ORDER else 999, x))
+    vals = [v for v in vals if v in ALLOWED_TEAMS]
+    vals = sorted(set(vals), key=lambda x: TEAM_ORDER.index(x))
     return vals
 
 
@@ -1862,13 +1863,12 @@ with st.sidebar:
         )
 
 min_d, max_d = available_date_bounds(bundle)
-all_teams = ordered_teams(
-    list(bundle["daily"].get("team", pd.Series(dtype=str)).dropna().unique())
-    + list(bundle["roster"].get("roster_team", pd.Series(dtype=str)).dropna().unique())
-)
+# Keep the team selector fixed to the approved organization list, even if a
+# particular team has no observations in the currently loaded date range.
+all_teams = TEAM_ORDER.copy()
 
 with st.sidebar:
-    default_teams = [t for t in all_teams if t not in {"Washington", "Draft"}] or all_teams
+    default_teams = [t for t in all_teams if t != "Washington"] or all_teams
     teams = st.multiselect("Teams", options=all_teams, default=default_teams)
 
     default_start = max(min_d, max_d - pd.Timedelta(days=13)).date()
