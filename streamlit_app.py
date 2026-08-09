@@ -794,7 +794,8 @@ def run_api_sync(start_value, end_value) -> tuple[str, bool]:
 
 def clean_roster(roster: pd.DataFrame) -> pd.DataFrame:
     if roster is None or roster.empty:
-        return pd.DataFrame(columns=["player_key", "player_name", "roster_team", "position"])
+        return pd.DataFrame(columns=["player_key", "player_name", "roster_team", "position", "is_pitcher"])
+
     r = roster.copy()
     rename = {}
     for c in r.columns:
@@ -806,16 +807,39 @@ def clean_roster(roster: pd.DataFrame) -> pd.DataFrame:
         elif lc == "position":
             rename[c] = "position"
     r = r.rename(columns=rename)
+
     for c in ["player_name", "roster_team", "position"]:
         if c not in r.columns:
             r[c] = ""
+
     r["player_name"] = r["player_name"].astype(str).str.strip()
     r = r[r["player_name"].ne("")].copy()
     r["player_key"] = r["player_name"].apply(normalize_name)
     r["roster_team"] = r["roster_team"].apply(clean_team)
     r["position"] = r["position"].astype(str).str.strip()
-    r = r.drop_duplicates("player_key", keep="last")
-    return r[["player_key", "player_name", "roster_team", "position"]]
+
+    # A player can appear more than once in Master Roster. The prior version kept
+    # only the final duplicate row, which could erase a P designation when a later
+    # historical/administrative row had a blank Position. Preserve a pitcher flag
+    # if ANY roster row for that normalized player is labeled P/Pitcher.
+    r["_is_pitcher"] = r["position"].apply(is_pitcher_position)
+    pitcher_by_key = r.groupby("player_key")["_is_pitcher"].any().to_dict()
+
+    def last_nonblank(series):
+        vals = series.dropna().astype(str).str.strip()
+        vals = vals[~vals.str.casefold().isin({"", "nan", "none"})]
+        return vals.iloc[-1] if not vals.empty else ""
+
+    r = (
+        r.groupby("player_key", as_index=False)
+         .agg(
+             player_name=("player_name", last_nonblank),
+             roster_team=("roster_team", last_nonblank),
+             position=("position", last_nonblank),
+         )
+    )
+    r["is_pitcher"] = r["player_key"].map(pitcher_by_key).fillna(False).astype(bool)
+    return r[["player_key", "player_name", "roster_team", "position", "is_pitcher"]]
 
 
 def clean_practice(raw: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -832,6 +856,18 @@ def clean_practice(raw: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFram
         df[c] = df[c].astype(str).str.strip()
     df = df[df["player_name"].ne("")].copy()
     df["player_key"] = df["player_name"].apply(normalize_name)
+
+    # Exclude pitchers before any practice aggregation so they cannot leak into
+    # team totals, status calculations, charts, player selectors, or PDFs.
+    if not roster.empty:
+        if "is_pitcher" in roster.columns:
+            pitcher_keys = set(roster.loc[roster["is_pitcher"], "player_key"].dropna())
+        else:
+            pitcher_keys = set(
+                roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+            )
+        if pitcher_keys:
+            df = df[~df["player_key"].isin(pitcher_keys)].copy()
 
     for c in PRACTICE_NUMERIC:
         if c not in df.columns:
@@ -899,6 +935,17 @@ def clean_games(pp: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["date"])
     df = df[df["player_key"].ne("")].copy()
 
+    # Exclude pitchers from PP_Sprint/game data too.
+    if not roster.empty:
+        if "is_pitcher" in roster.columns:
+            pitcher_keys = set(roster.loc[roster["is_pitcher"], "player_key"].dropna())
+        else:
+            pitcher_keys = set(
+                roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+            )
+        if pitcher_keys:
+            df = df[~df["player_key"].isin(pitcher_keys)].copy()
+
     metric_map = {
         "max_effort_runs": "game_max_effort_runs",
         "max_effort_distance_covered_yards": "game_max_effort_distance_yards",
@@ -936,6 +983,55 @@ def clean_games(pp: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     else:
         out["game_days"] = 1
     out["game_observed"] = 1
+    return out
+
+
+def add_practice_peer_zscores(daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add leave-one-out same-practice peer z-scores for GPS workload metrics.
+
+    Each athlete is compared with the OTHER position players from the same
+    team on the same practice date. Game-only rows and athletes without a GPS
+    practice observation that day are excluded from the peer baseline.
+
+    A minimum of 3 peers (4 total observed position players) is required.
+    """
+    out = daily.copy()
+    out["hsr_peer_z"] = np.nan
+    out["accel_peer_z"] = np.nan
+    out["practice_peer_n"] = 0
+
+    if out.empty:
+        return out
+
+    eligible = safe_num(out.get("practice_observed", pd.Series(0, index=out.index)), fill=0) > 0
+    eligible &= out.get("team", pd.Series("", index=out.index)).isin(ALLOWED_TEAMS)
+
+    metric_map = [
+        ("hsr_distance_m", "hsr_peer_z"),
+        ("n_accelerations", "accel_peer_z"),
+    ]
+
+    observed = out.loc[eligible]
+    for (_, _), idx in observed.groupby(["date", "team"], dropna=False).groups.items():
+        idx = list(idx)
+        if len(idx) < 4:
+            continue
+        out.loc[idx, "practice_peer_n"] = len(idx) - 1
+
+        for metric, zcol in metric_map:
+            vals = safe_num(out.loc[idx, metric])
+            for row_idx in idx:
+                value = vals.loc[row_idx]
+                if pd.isna(value):
+                    continue
+                peers = vals.drop(index=row_idx).dropna()
+                if len(peers) < 3:
+                    continue
+                peer_sd = peers.std(ddof=1)
+                if pd.notna(peer_sd) and peer_sd > 0:
+                    out.at[row_idx, zcol] = (float(value) - float(peers.mean())) / float(peer_sd)
+
     return out
 
 
@@ -1003,6 +1099,23 @@ def combine_daily(practice_daily: pd.DataFrame, games_daily: pd.DataFrame, roste
     d["combined_total_distance_m"] = d["total_distance_m"] + d["game_distance_m"]
     d["combined_high_intensity_m"] = d["hsr_distance_m"] + d["game_max_effort_distance_m"]
     d["activity_observed"] = ((d["practice_observed"] > 0) | (d["game_observed"] > 0)).astype(int)
+
+    # Final defensive exclusion in case a pitcher row arrives through a source
+    # path that bypassed the earlier practice/game filters.
+    if not roster.empty:
+        if "is_pitcher" in roster.columns:
+            pitcher_keys = set(roster.loc[roster["is_pitcher"], "player_key"].dropna())
+        else:
+            pitcher_keys = set(
+                roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+            )
+        if pitcher_keys:
+            d = d[~d["player_key"].isin(pitcher_keys)].copy()
+
+    # GPS flags are peer-relative: compare each athlete with the OTHER position
+    # players in the same team practice on that date.
+    d = add_practice_peer_zscores(d)
+
     return d.sort_values(["player_key", "date"]).reset_index(drop=True)
 
 
@@ -1045,28 +1158,24 @@ def build_history_calendar(daily: pd.DataFrame, roster: pd.DataFrame) -> pd.Data
             "mechanical_load", "duration_min", "practice_observed", "game_days",
             "game_max_effort_runs", "game_max_effort_distance_yards", "game_distance_yards",
             "game_distance_m", "game_max_effort_distance_m", "combined_total_distance_m",
-            "combined_high_intensity_m", "game_observed", "activity_observed",
+            "combined_high_intensity_m", "game_observed", "activity_observed", "practice_peer_n",
         ]
         for c in fill_zero:
             if c not in merged.columns:
                 merged[c] = 0.0
             merged[c] = safe_num(merged[c], fill=0)
 
-        for c in ["top_speed_ms", "max_accel_ms2"]:
+        for c in ["top_speed_ms", "max_accel_ms2", "hsr_peer_z", "accel_peer_z"]:
             if c not in merged.columns:
                 merged[c] = np.nan
             merged[c] = safe_num(merged[c])
 
-        # 7-day acute load vs normalized 28-day chronic load.
-        acute7 = merged["combined_total_distance_m"].rolling(7, min_periods=1).sum()
-        chronic28 = merged["combined_total_distance_m"].rolling(28, min_periods=7).sum() / 4.0
+        # ACWR is STRICTLY PP_Sprint game load. Practice GPS does not contribute.
+        # PP_Sprint distance_covered_yards is converted to game_distance_m above;
+        # the ratio is therefore based only on rolling game total-distance load.
+        acute7 = merged["game_distance_m"].rolling(7, min_periods=1).sum()
+        chronic28 = merged["game_distance_m"].rolling(28, min_periods=7).sum() / 4.0
         merged["acwr"] = np.where(chronic28 > 0, acute7 / chronic28, np.nan)
-
-        # Individual prior-14-calendar-day z-scores. Current day is excluded from baseline.
-        for metric, outcol in [("hsr_distance_m", "hsr_z14"), ("n_accelerations", "accel_z14")]:
-            prior_mean = merged[metric].shift(1).rolling(14, min_periods=5).mean()
-            prior_sd = merged[metric].shift(1).rolling(14, min_periods=5).std(ddof=1)
-            merged[outcol] = np.where(prior_sd > 0, (merged[metric] - prior_mean) / prior_sd, np.nan)
 
         pieces.append(merged)
 
@@ -1153,14 +1262,21 @@ def eligible_player_keys(bundle, start_date, end_date, teams, selected_keys=None
     if teams and not roster.empty:
         keys |= set(roster.loc[roster["roster_team"].isin(teams), "player_key"].dropna())
 
-    # Position-player dashboard: exclude anyone whose roster position is labeled
-    # "P" or "Pitcher". This removes them from player selectors, tables,
-    # charts, flags, team summaries, and generated PDFs.
-    if not roster.empty and "position" in roster.columns:
-        pitcher_keys = set(
-            roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+    # Position-player dashboard: exclude pitchers using the preserved roster flag.
+    # Also inspect the daily Position field as a fallback for unmatched roster rows.
+    pitcher_keys = set()
+    if not roster.empty:
+        if "is_pitcher" in roster.columns:
+            pitcher_keys |= set(roster.loc[roster["is_pitcher"], "player_key"].dropna())
+        elif "position" in roster.columns:
+            pitcher_keys |= set(
+                roster.loc[roster["position"].apply(is_pitcher_position), "player_key"].dropna()
+            )
+    if "position" in within.columns:
+        pitcher_keys |= set(
+            within.loc[within["position"].apply(is_pitcher_position), "player_key"].dropna()
         )
-        keys -= pitcher_keys
+    keys -= pitcher_keys
 
     if selected_keys:
         keys &= set(selected_keys)
@@ -1209,22 +1325,26 @@ def classify_status(today, last_sprint_days, criteria=None):
         return "Data Check", "No GPS/game session"
 
     acwr = today.get("acwr", np.nan)
-    hz = today.get("hsr_z14", np.nan)
-    az = today.get("accel_z14", np.nan)
+    hz = today.get("hsr_peer_z", np.nan)
+    az = today.get("accel_peer_z", np.nan)
 
     if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["review_acwr"]:
         return "Review", f"ACWR {acwr:.2f}"
-    if criteria["use_hsr_z"] and pd.notna(hz) and hz >= criteria["review_z"]:
-        return "Review", f"HSR spike ({hz:+.1f} z)"
-    if criteria["use_accel_z"] and pd.notna(az) and az >= criteria["review_z"]:
-        return "Review", f"Acceleration spike ({az:+.1f} z)"
+    if criteria["use_hsr_z"] and pd.notna(hz) and abs(float(hz)) >= criteria["review_z"]:
+        direction = "high" if hz > 0 else "low"
+        return "Review", f"HSR {direction} vs practice ({hz:+.1f} z)"
+    if criteria["use_accel_z"] and pd.notna(az) and abs(float(az)) >= criteria["review_z"]:
+        direction = "high" if az > 0 else "low"
+        return "Review", f"Accelerations {direction} vs practice ({az:+.1f} z)"
 
     if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["monitor_acwr"]:
         return "Monitor", f"ACWR {acwr:.2f}"
-    if criteria["use_hsr_z"] and pd.notna(hz) and hz >= criteria["monitor_z"]:
-        return "Monitor", f"HSR elevated ({hz:+.1f} z)"
-    if criteria["use_accel_z"] and pd.notna(az) and az >= criteria["monitor_z"]:
-        return "Monitor", f"Accelerations elevated ({az:+.1f} z)"
+    if criteria["use_hsr_z"] and pd.notna(hz) and abs(float(hz)) >= criteria["monitor_z"]:
+        direction = "high" if hz > 0 else "low"
+        return "Monitor", f"HSR {direction} vs practice ({hz:+.1f} z)"
+    if criteria["use_accel_z"] and pd.notna(az) and abs(float(az)) >= criteria["monitor_z"]:
+        direction = "high" if az > 0 else "low"
+        return "Monitor", f"Accelerations {direction} vs practice ({az:+.1f} z)"
 
     if criteria["use_sprint_gap"] and (
         last_sprint_days is None or last_sprint_days > criteria["sprint_gap_days"]
@@ -1417,7 +1537,7 @@ TREND_METRICS = [
     ("hsr_distance_m", "HSR", "m", "sum"),
     ("combined_total_distance_m", "Total Distance", "m", "sum"),
     ("duration_min", "Duration", "min", "sum"),
-    ("acwr", "ACWR", "ratio", "last"),
+    ("acwr", "PP_Sprint ACWR", "ratio", "last"),
 ]
 
 
@@ -1575,7 +1695,7 @@ def make_pdf_bytes(bundle, start_date, end_date, teams, player_keys, criteria=No
             if criteria["use_accel_z"]:
                 labels.append("Accel")
             active_rules.append(
-                f'{" + ".join(labels)} z Monitor≥{criteria["monitor_z"]:.1f} / Review≥{criteria["review_z"]:.1f}'
+                f'{" + ".join(labels)} |practice-peer z| Monitor≥{criteria["monitor_z"]:.1f} / Review≥{criteria["review_z"]:.1f}'
             )
         if criteria["use_sprint_gap"]:
             active_rules.append(f'Sprint gap>{criteria["sprint_gap_days"]}d')
@@ -1954,19 +2074,28 @@ with st.sidebar:
             disabled=not use_low_acwr,
         )
 
-        st.markdown("**14-day individual workload spikes**")
+        st.caption(
+            "ACWR uses PP_Sprint game total distance only: 7-day load divided by the normalized 28-day game load. "
+            "Practice GPS load is not included in ACWR."
+        )
+
+        st.markdown("**Same-practice GPS outliers**")
+        st.caption(
+            "HSR and accelerations are leave-one-out z-scores versus the other position players "
+            "in that team's practice on the same date. Both unusually high and unusually low values can flag."
+        )
         use_hsr_z = st.checkbox(
-            "Use HSR z-score",
+            "Use HSR practice-peer z-score",
             value=DEFAULT_FLAG_CRITERIA["use_hsr_z"],
             key="flag_use_hsr_z",
         )
         use_accel_z = st.checkbox(
-            "Use acceleration z-score",
+            "Use acceleration practice-peer z-score",
             value=DEFAULT_FLAG_CRITERIA["use_accel_z"],
             key="flag_use_accel_z",
         )
         z_monitor, z_review = st.slider(
-            "Z-score thresholds — Monitor / Review",
+            "Absolute peer z-score thresholds — Monitor / Review",
             min_value=0.50,
             max_value=4.00,
             value=(
@@ -2131,7 +2260,7 @@ with player_tab:
         unsafe_allow_html=True,
     )
     st.caption(
-        f"{row.get('Primary Driver', '')} · ACWR "
+        f"{row.get('Primary Driver', '')} · PP_Sprint ACWR "
         f"{'—' if pd.isna(acwr) else f'{float(acwr):.2f}'} · "
         f"Last game {row.get('Last Game Load', '—')} · Last sprint {row.get('Last Sprint', '—')}"
     )
@@ -2188,7 +2317,7 @@ if flag_criteria["use_hsr_z"] or flag_criteria["use_accel_z"]:
     if flag_criteria["use_accel_z"]:
         active_metrics.append("acceleration")
     active_criteria_parts.append(
-        f'{" + ".join(active_metrics)} z-score Monitor ≥ {flag_criteria["monitor_z"]:.1f}, '
+        f'{" + ".join(active_metrics)} |practice-peer z| Monitor ≥ {flag_criteria["monitor_z"]:.1f}, '
         f'Review ≥ {flag_criteria["review_z"]:.1f}'
     )
 if flag_criteria["use_sprint_gap"]:
