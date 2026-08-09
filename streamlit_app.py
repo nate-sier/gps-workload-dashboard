@@ -1525,9 +1525,17 @@ PLOT_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
     font=dict(family="Inter, Arial, sans-serif", color=C_TEXT, size=12),
-    margin=dict(l=42, r=22, t=52, b=44),
+    margin=dict(l=54, r=24, t=58, b=44),
     hoverlabel=dict(bgcolor="white", bordercolor=C_BORDER, font_size=12),
+    hovermode="x unified",
 )
+
+# Restrained comparison palette. Lines carry the information; markers are intentionally
+# omitted so multi-player trend charts stay clean even over long date ranges.
+COMPARISON_COLORS = [
+    C_RED, C_NAVY, C_BLUE, C_GREEN, C_AMBER, C_PURPLE,
+    "#0F766E", "#9333EA", "#475569", "#B45309",
+]
 
 TREND_METRICS = [
     ("top_speed_ms", "Top Speed", "m/s", "max"),
@@ -1547,38 +1555,160 @@ def empty_figure(title="No data"):
     return fig
 
 
-def player_trend_figure(df, metric, title, unit, criteria=None):
+def _trend_rows_for_metric(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Keep only meaningful observations for a trend line.
+
+    GPS metrics are plotted on actual practice-observed dates only so off-days do
+    not create artificial zero-value sawtooths. PP_Sprint ACWR remains a daily
+    rolling series and is therefore allowed to span the full calendar.
+    """
     if df is None or df.empty or metric not in df.columns:
+        return pd.DataFrame()
+    p = df.copy().sort_values("date")
+    if metric != "acwr" and "practice_observed" in p.columns:
+        p = p[safe_num(p["practice_observed"], 0) > 0].copy()
+    p[metric] = safe_num(p[metric])
+    p = p[p[metric].notna()].copy()
+    return p
+
+
+def comparison_trend_figure(
+    bundle,
+    start_date,
+    end_date,
+    player_keys,
+    teams,
+    metric,
+    title,
+    unit,
+    show_team_average=False,
+    criteria=None,
+):
+    """Compare multiple players on one clean trend chart with optional team means."""
+    history = bundle.get("history_calendar", pd.DataFrame())
+    if history is None or history.empty:
         return empty_figure(title)
-    p = df.sort_values("date")
-    y = safe_num(p[metric])
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    display = player_display_map(bundle)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=p["date"], y=y,
-        mode="lines+markers",
-        line=dict(color=C_NAVY, width=2),
-        marker=dict(color=C_RED, size=6),
-        hovertemplate=f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>",
-    ))
+    plotted = 0
+
+    for idx, key in enumerate(player_keys or []):
+        p = history[
+            history["date"].between(start, end) & history["player_key"].eq(key)
+        ].copy()
+        p = _trend_rows_for_metric(p, metric)
+        if p.empty:
+            continue
+        color = COMPARISON_COLORS[idx % len(COMPARISON_COLORS)]
+        fig.add_trace(go.Scatter(
+            x=p["date"],
+            y=p[metric],
+            mode="lines",
+            name=display.get(key, key),
+            line=dict(color=color, width=2.6),
+            connectgaps=False,
+            hovertemplate=(
+                f"<b>{display.get(key, key)}</b><br>"
+                f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>"
+            ),
+        ))
+        plotted += 1
+
+    if show_team_average:
+        # Team means use ALL eligible position players on that team, regardless of
+        # which athletes are selected for the individual comparison traces.
+        avg_team_values = list(teams or [])
+        if not avg_team_values:
+            if player_keys:
+                avg_team_values = list(
+                    history.loc[history["player_key"].isin(player_keys), "team"].dropna().unique()
+                )
+            else:
+                avg_team_values = list(history["team"].dropna().unique())
+        avg_teams = ordered_teams(avg_team_values)
+        for team_idx, team in enumerate(avg_teams):
+            team_keys = eligible_player_keys(bundle, start, end, [team], selected_keys=None)
+            th = history[
+                history["date"].between(start, end) & history["player_key"].isin(team_keys)
+            ].copy()
+            th = _trend_rows_for_metric(th, metric)
+            if th.empty:
+                continue
+            team_daily = (
+                th.groupby("date", as_index=False)[metric]
+                  .mean()
+                  .sort_values("date")
+            )
+            fig.add_trace(go.Scatter(
+                x=team_daily["date"],
+                y=team_daily[metric],
+                mode="lines",
+                name=f"{team} team avg",
+                line=dict(color=C_GRAY, width=3.2, dash="dash"),
+                opacity=max(0.55, 0.92 - team_idx * 0.08),
+                connectgaps=False,
+                hovertemplate=(
+                    f"<b>{team} team average</b><br>"
+                    f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>"
+                ),
+            ))
+            plotted += 1
+
     if metric == "acwr":
         criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
         refs = []
         if criteria["use_low_acwr"]:
-            refs.append((criteria["low_acwr"], C_BLUE, f'{criteria["low_acwr"]:.2f}'))
+            refs.append((criteria["low_acwr"], C_BLUE))
         if criteria["use_high_acwr"]:
             refs.extend([
-                (criteria["monitor_acwr"], C_AMBER, f'{criteria["monitor_acwr"]:.2f}'),
-                (criteria["review_acwr"], C_RED, f'{criteria["review_acwr"]:.2f}'),
+                (criteria["monitor_acwr"], C_AMBER),
+                (criteria["review_acwr"], C_RED),
             ])
-        for val, color, label in refs:
-            fig.add_hline(y=val, line_dash="dash", line_color=color, opacity=0.7)
+        for val, color in refs:
+            fig.add_hline(
+                y=val,
+                line_dash="dot",
+                line_color=color,
+                line_width=1.2,
+                opacity=0.55,
+            )
+
+    if plotted == 0:
+        return empty_figure(title)
+
+    y_title = unit if unit != "#" else "Count"
     fig.update_layout(
         **PLOT_LAYOUT,
-        height=315,
-        title=dict(text=title, x=0, font=dict(size=15, color=C_NAVY)),
-        xaxis=dict(showgrid=False),
-        yaxis=dict(showgrid=True, gridcolor=C_BORDER, zeroline=False, title=unit if unit != "#" else "Count"),
-        showlegend=False,
+        height=500,
+        title=dict(text=title, x=0, font=dict(size=18, color=C_TEXT)),
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showline=True,
+            linecolor=C_BORDER,
+            linewidth=1,
+            tickformat="%b %d",
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#E9EEF5",
+            gridwidth=1,
+            zeroline=False,
+            showline=False,
+            title=y_title,
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=11),
+        ),
     )
     return fig
 
@@ -1598,15 +1728,16 @@ def team_period_figure(bundle, start_date, end_date, player_keys):
         fig.add_trace(go.Scatter(
             x=t["date"], y=t["avg_total_distance"], mode="lines",
             name=team,
+            line=dict(width=2.6),
             hovertemplate=f"<b>{team}</b><br>%{{x|%b %d}}<br>%{{y:.0f}} m/player<extra></extra>",
         ))
     fig.update_layout(
         **PLOT_LAYOUT,
         height=390,
         title=dict(text="Average Combined Distance by Team", x=0, font=dict(size=16, color=C_NAVY)),
-        xaxis=dict(showgrid=False),
-        yaxis=dict(title="m / player / day", showgrid=True, gridcolor=C_BORDER, zeroline=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(showgrid=False, showline=True, linecolor=C_BORDER, linewidth=1),
+        yaxis=dict(title="m / player / day", showgrid=True, gridcolor="#E9EEF5", zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, bgcolor="rgba(0,0,0,0)"),
     )
     return fig
 
@@ -1822,23 +1953,60 @@ st.set_page_config(
 st.markdown(
     f"""
     <style>
-      .block-container {{padding-top: 1.3rem; padding-bottom: 3rem;}}
-      h1, h2, h3 {{color: {C_NAVY};}}
-      [data-testid="stMetric"] {{
-          background: white;
-          border: 1px solid {C_BORDER};
-          border-radius: 12px;
-          padding: 12px 14px;
+      .block-container {{
+          padding-top: 1.05rem;
+          padding-bottom: 3rem;
+          max-width: 1500px;
       }}
-      .gps-subtle {{color: {C_MUTED}; font-size: 0.9rem;}}
+      h1, h2, h3 {{
+          color: {C_TEXT};
+          letter-spacing: -0.025em;
+      }}
+      h1 {{font-weight: 650;}}
+      h2, h3 {{font-weight: 600;}}
+      [data-testid="stMetric"] {{
+          background: transparent;
+          border: 0;
+          border-top: 1px solid {C_BORDER};
+          border-bottom: 1px solid {C_BORDER};
+          border-radius: 0;
+          padding: 12px 4px 10px 4px;
+      }}
+      [data-testid="stMetricLabel"] {{color: {C_MUTED};}}
+      [data-testid="stDataFrame"] {{
+          border: 1px solid {C_BORDER};
+          border-radius: 4px;
+          overflow: hidden;
+      }}
+      .stTabs [data-baseweb="tab-list"] {{
+          gap: 1.4rem;
+          border-bottom: 1px solid {C_BORDER};
+      }}
+      .stTabs [data-baseweb="tab"] {{
+          height: 2.8rem;
+          padding-left: 0;
+          padding-right: 0;
+          border-radius: 0;
+          background: transparent;
+      }}
+      .stButton button, .stDownloadButton button {{
+          border-radius: 5px !important;
+          box-shadow: none !important;
+      }}
+      [data-testid="stExpander"] {{
+          border-color: {C_BORDER};
+          border-radius: 5px;
+      }}
+      .gps-subtle {{color: {C_MUTED}; font-size: 0.9rem; margin-bottom: 0.4rem;}}
       .gps-badge {{
           display: inline-block;
-          padding: 0.2rem 0.55rem;
-          border-radius: 999px;
-          font-size: 0.78rem;
+          padding: 0.18rem 0.48rem;
+          border-radius: 4px;
+          font-size: 0.76rem;
           font-weight: 700;
           color: white;
       }}
+      hr {{border-color: {C_BORDER};}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -2223,7 +2391,7 @@ overview_tab, player_tab, summary_tab = st.tabs(
 )
 
 with overview_tab:
-    st.subheader("End-of-Period Athlete Snapshot")
+    st.subheader("Athlete Snapshot")
     if status.empty:
         st.info("No status rows for this selection.")
     else:
@@ -2235,7 +2403,7 @@ with overview_tab:
         show["ACWR"] = pd.to_numeric(show["ACWR"], errors="coerce").round(2)
         st.dataframe(show, use_container_width=True, hide_index=True, height=520)
 
-    st.subheader("Average Combined Distance by Team")
+    st.subheader("Team Workload Trend")
     st.plotly_chart(
         team_period_figure(bundle, start_date, end_date, keys),
         use_container_width=True,
@@ -2243,38 +2411,82 @@ with overview_tab:
     )
 
 with player_tab:
-    player_key = st.selectbox(
-        "Player detail",
-        options=sorted(keys, key=lambda k: display_map.get(k, k)),
-        format_func=lambda k: display_map.get(k, k),
-    )
-    one_status = build_status_table(bundle, end_date, [player_key], criteria=flag_criteria)
-    row = one_status.iloc[0].to_dict() if not one_status.empty else {}
-    h = selected_history(bundle, start_date, end_date, [player_key])
-
-    badge_color = STATUS_COLORS.get(row.get("Status", "Data Check"), C_GRAY)
-    acwr = row.get("ACWR", np.nan)
-    st.markdown(
-        f'<span class="gps-badge" style="background:{badge_color}">{row.get("Status", "—")}</span> '
-        f'<strong>{row.get("Team", "")} · {row.get("Pos", "")}</strong>',
-        unsafe_allow_html=True,
-    )
+    st.subheader("Player Comparison")
     st.caption(
-        f"{row.get('Primary Driver', '')} · PP_Sprint ACWR "
-        f"{'—' if pd.isna(acwr) else f'{float(acwr):.2f}'} · "
-        f"Last game {row.get('Last Game Load', '—')} · Last sprint {row.get('Last Sprint', '—')}"
+        "Compare multiple position players on the same line chart. Team average uses every "
+        "eligible position player who participated in that team's practice on each date."
     )
 
-    metric_pairs = [TREND_METRICS[i:i + 2] for i in range(0, len(TREND_METRICS), 2)]
-    for pair in metric_pairs:
-        chart_cols = st.columns(2)
-        for c, (metric, title, unit, _) in zip(chart_cols, pair):
-            with c:
-                st.plotly_chart(
-                    player_trend_figure(h, metric, title, unit, criteria=flag_criteria),
-                    use_container_width=True,
-                    config={"displaylogo": False, "displayModeBar": False},
-                )
+    comparison_options = sorted(keys, key=lambda k: display_map.get(k, k))
+    sidebar_selected_in_scope = [k for k in (selected_players or []) if k in comparison_options]
+    default_comparison = sidebar_selected_in_scope[:6]
+    if not default_comparison and comparison_options:
+        default_comparison = comparison_options[:1]
+
+    control_a, control_b = st.columns([2.2, 1])
+    with control_a:
+        trend_players = st.multiselect(
+            "Players to compare",
+            options=comparison_options,
+            default=default_comparison,
+            format_func=lambda k: display_map.get(k, k),
+            help="Select as many players as you want. For readability, 2–6 is usually best.",
+        )
+    with control_b:
+        show_team_average = st.checkbox(
+            "Show whole-team average",
+            value=False,
+            help="Uses all eligible position players on the selected team(s), not just the players above.",
+        )
+
+    metric_lookup = {metric: (title, unit, agg) for metric, title, unit, agg in TREND_METRICS}
+    metric_keys = list(metric_lookup)
+    metric = st.selectbox(
+        "Metric",
+        options=metric_keys,
+        index=metric_keys.index("combined_total_distance_m") if "combined_total_distance_m" in metric_keys else 0,
+        format_func=lambda m: metric_lookup[m][0],
+    )
+    trend_title, trend_unit, _ = metric_lookup[metric]
+
+    if not trend_players and not show_team_average:
+        st.info("Select at least one player or turn on the whole-team average.")
+    else:
+        st.plotly_chart(
+            comparison_trend_figure(
+                bundle,
+                start_date,
+                end_date,
+                trend_players,
+                teams,
+                metric,
+                trend_title,
+                trend_unit,
+                show_team_average=show_team_average,
+                criteria=flag_criteria,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "displayModeBar": False,
+                "responsive": True,
+            },
+        )
+
+    if trend_players:
+        comparison_status = build_status_table(
+            bundle, end_date, trend_players, criteria=flag_criteria
+        )
+        if not comparison_status.empty:
+            compact_cols = ["Athlete", "Team", "Pos", "Status", "Primary Driver", "ACWR"]
+            compact = comparison_status[compact_cols].copy()
+            compact["ACWR"] = pd.to_numeric(compact["ACWR"], errors="coerce").round(2)
+            st.dataframe(
+                compact,
+                use_container_width=True,
+                hide_index=True,
+                height=min(320, 38 + 36 * len(compact)),
+            )
 
 with summary_tab:
     st.subheader("Selected-Period Player Totals")
