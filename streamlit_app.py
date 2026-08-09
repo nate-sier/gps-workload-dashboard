@@ -1584,7 +1584,7 @@ def comparison_trend_figure(
     show_team_average=False,
     criteria=None,
     restrict_player_teams=None,
-    show_legend=True,
+    legend_mode="auto",
 ):
     """Compare multiple players on one clean trend chart with optional team means."""
     history = bundle.get("history_calendar", pd.DataFrame())
@@ -1596,6 +1596,20 @@ def comparison_trend_figure(
     display = player_display_map(bundle)
     fig = go.Figure()
     plotted = 0
+
+    player_count = len(player_keys or [])
+    if legend_mode == "all":
+        show_player_legend = True
+        show_average_legend = True
+    elif legend_mode == "team averages":
+        show_player_legend = False
+        show_average_legend = True
+    elif legend_mode == "off":
+        show_player_legend = False
+        show_average_legend = False
+    else:  # auto
+        show_player_legend = player_count <= 8
+        show_average_legend = True
 
     for idx, key in enumerate(player_keys or []):
         p = history[
@@ -1615,6 +1629,7 @@ def comparison_trend_figure(
             line=dict(color=color, width=1.9),
             opacity=0.82,
             connectgaps=False,
+            showlegend=show_player_legend,
             hovertemplate=(
                 f"<b>{display.get(key, key)}</b><br>"
                 f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>"
@@ -1654,9 +1669,10 @@ def comparison_trend_figure(
                 y=team_daily[metric],
                 mode="lines",
                 name=f"{team} TEAM AVG",
-                line=dict(color=C_TEXT, width=4.2),
-                opacity=max(0.72, 1.0 - team_idx * 0.06),
+                line=dict(color=C_TEXT, width=4.2, dash="dash"),
+                opacity=max(0.78, 1.0 - team_idx * 0.05),
                 connectgaps=False,
+                showlegend=show_average_legend,
                 hovertemplate=(
                     f"<b>{team} team average</b><br>"
                     f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.2f}} {unit}<extra></extra>"
@@ -1687,10 +1703,18 @@ def comparison_trend_figure(
         return empty_figure(title)
 
     y_title = unit if unit != "#" else "Count"
-    fig.update_layout(
+    # Keep the legend completely away from the title/plot. In Auto mode, large
+    # team views hide individual legend entries and retain only team averages;
+    # every individual line is still identified on hover.
+    legend_all_large = legend_mode == "all" and player_count > 8
+    comparison_layout = {
         **PLOT_LAYOUT,
-        height=560,
-        title=dict(text=title, x=0, font=dict(size=18, color=C_TEXT)),
+        "margin": dict(l=54, r=28, t=72, b=150 if legend_all_large else 92),
+    }
+    fig.update_layout(
+        **comparison_layout,
+        height=650 if legend_all_large else 590,
+        title=dict(text=title, x=0, xanchor="left", font=dict(size=18, color=C_TEXT)),
         xaxis=dict(
             showgrid=False,
             zeroline=False,
@@ -1698,6 +1722,7 @@ def comparison_trend_figure(
             linecolor=C_BORDER,
             linewidth=1,
             tickformat="%b %d",
+            title=None,
         ),
         yaxis=dict(
             showgrid=True,
@@ -1709,14 +1734,16 @@ def comparison_trend_figure(
         ),
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.02,
+            yanchor="top",
+            y=-0.16,
             xanchor="left",
             x=0,
             bgcolor="rgba(0,0,0,0)",
-            font=dict(size=11),
+            font=dict(size=10),
+            title=None,
         ),
-        showlegend=show_legend,
+        hovermode="x unified" if player_count <= 8 else "closest",
+        showlegend=(show_player_legend or show_average_legend),
     )
     return fig
 
@@ -2421,42 +2448,86 @@ with overview_tab:
 with player_tab:
     st.subheader("Trend Comparison")
     st.caption(
-        "Start with no teams selected. Click one or more team names to show every eligible "
-        "position player on those teams plus a team-average line. Leave Teams blank to compare "
-        "specific players instead."
+        "Pick team(s) to seed the chart with all of their eligible position players, then use "
+        "the player selector to remove anyone or add players from any other approved team. "
+        "Team-average lines stay tied to the team selector."
     )
 
     # Player Trends is intentionally independent of the sidebar team/player filters.
-    # This avoids having to deselect the organization-level filters just to inspect a team.
-    trend_team_options = []
-    for team in TEAM_ORDER:
-        if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None):
-            trend_team_options.append(team)
+    trend_team_options = [
+        team for team in TEAM_ORDER
+        if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
+    ]
 
-    # Use clickable team pills when the installed Streamlit version supports them.
-    # A multiselect fallback keeps the app compatible with older Streamlit builds.
     if hasattr(st, "pills"):
         trend_selected_teams = st.pills(
-            "Teams",
+            "Team averages / quick-select",
             options=trend_team_options,
             selection_mode="multi",
             default=[],
-            key="trend_team_pills_none_default_v1",
-            help="Nothing is selected by default. Select any team(s) to load all players and team averages.",
+            key="trend_team_pills_flexible_v2",
+            help=(
+                "Selecting a team adds its full eligible roster as the initial player selection "
+                "and plots that team's average. You can still add/remove any individual player below."
+            ),
         ) or []
     else:
         trend_selected_teams = st.multiselect(
-            "Teams",
+            "Team averages / quick-select",
             options=trend_team_options,
             default=[],
-            key="trend_team_multiselect_none_default_v1",
+            key="trend_team_multiselect_flexible_v2",
             placeholder="Select team(s)",
-            help="Nothing is selected by default. Select any team(s) to load all players and team averages.",
         )
+
+    # The individual player selector is ALWAYS visible and ALWAYS contains all
+    # eligible position players across the approved teams. Team selection only
+    # determines the default player set and which team-average lines are shown.
+    trend_scope_keys = eligible_player_keys(
+        bundle, start_date, end_date, TEAM_ORDER, selected_keys=None
+    )
+    all_player_options = sorted(trend_scope_keys, key=lambda k: display_map.get(k, k))
+
+    seeded_players = []
+    for team in trend_selected_teams:
+        seeded_players.extend(
+            eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
+        )
+    seeded_players = sorted(set(seeded_players), key=lambda k: display_map.get(k, k))
+
+    # Using a team-specific key makes a new team click seed that team's roster,
+    # while the user can freely edit the multiselect after the seed is created.
+    player_seed_key = "_".join(
+        re.sub(r"[^a-z0-9]+", "_", str(t).casefold()).strip("_")
+        for t in trend_selected_teams
+    ) or "custom"
+
+    roster = bundle.get("roster", pd.DataFrame())
+    roster_team_map = (
+        roster.set_index("player_key")["roster_team"].to_dict()
+        if roster is not None and not roster.empty and "roster_team" in roster.columns
+        else {}
+    )
+
+    trend_players = st.multiselect(
+        "Players shown on chart",
+        options=all_player_options,
+        default=seeded_players,
+        format_func=lambda k: (
+            f"{display_map.get(k, k)} · {roster_team_map.get(k, '')}"
+            if roster_team_map.get(k, "") else display_map.get(k, k)
+        ),
+        key=f"trend_players_flexible_{player_seed_key}_v2",
+        help=(
+            "Remove players from the selected team(s), or search and add players from any other "
+            "approved team. Team averages are unaffected by individual player filtering."
+        ),
+        placeholder="Search any position player",
+    )
 
     metric_lookup = {metric: (title, unit, agg) for metric, title, unit, agg in TREND_METRICS}
     metric_keys = list(metric_lookup)
-    metric_col, legend_col = st.columns([2.4, 1])
+    metric_col, legend_col = st.columns([2.2, 1])
     with metric_col:
         metric = st.selectbox(
             "Metric",
@@ -2464,95 +2535,48 @@ with player_tab:
             index=metric_keys.index("combined_total_distance_m")
             if "combined_total_distance_m" in metric_keys else 0,
             format_func=lambda m: metric_lookup[m][0],
-            key="trend_metric",
+            key="trend_metric_flexible_v2",
         )
     with legend_col:
-        show_trend_legend = st.checkbox(
-            "Show player legend",
-            value=True,
-            key="trend_show_legend",
+        legend_mode_label = st.selectbox(
+            "Legend",
+            options=["Auto", "All", "Team averages only", "Off"],
+            index=0,
+            key="trend_legend_mode_v2",
+            help=(
+                "Auto shows individual names for smaller comparisons. For large team views it "
+                "shows only team-average legend entries; hover any line to identify the player."
+            ),
         )
     trend_title, trend_unit, _ = metric_lookup[metric]
+    legend_mode = {
+        "Auto": "auto",
+        "All": "all",
+        "Team averages only": "team averages",
+        "Off": "off",
+    }[legend_mode_label]
 
-    # Team mode: selecting any team loads every eligible player by default, but
-    # the chart player list is independently filterable. Team averages always use
-    # the full eligible team population, even when individual player lines are hidden.
+    show_team_average = bool(trend_selected_teams)
+    trend_teams = list(trend_selected_teams)
+    restrict_player_teams = None  # selected individuals may come from ANY approved team
+
     if trend_selected_teams:
-        all_team_players = []
-        for team in trend_selected_teams:
-            all_team_players.extend(
-                eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
-            )
-        all_team_players = sorted(
-            set(all_team_players), key=lambda k: display_map.get(k, k)
-        )
-
-        team_key_suffix = "_".join(
-            re.sub(r"[^a-z0-9]+", "_", str(t).casefold()).strip("_")
-            for t in trend_selected_teams
-        ) or "none"
-        trend_players = st.multiselect(
-            "Players shown on chart",
-            options=all_team_players,
-            default=all_team_players,
-            format_func=lambda k: display_map.get(k, k),
-            key=f"trend_team_players_{team_key_suffix}",
-            help=(
-                "All eligible position players are selected when you choose a team. "
-                "Remove any players you do not want plotted. The team-average line still "
-                "uses the full eligible team, so filtering player lines does not change the average."
-            ),
-            placeholder="Select player(s) to show",
-        )
-
-        trend_teams = list(trend_selected_teams)
-        show_team_average = True
-        restrict_player_teams = list(trend_selected_teams)
         chart_title = (
-            f"{' + '.join(trend_selected_teams)} — {trend_title}"
+            f"{' + '.join(trend_selected_teams)} + custom players — {trend_title}"
             if len(trend_selected_teams) <= 3
-            else f"Selected Teams — {trend_title}"
-        )
-        hidden_count = max(0, len(all_team_players) - len(trend_players))
-        st.markdown(
-            f'<div class="gps-subtle"><strong>{len(trend_players)} of {len(all_team_players)} players shown</strong> · '
-            f'{hidden_count} hidden · {len(trend_selected_teams)} team(s) · full-team average(s) retained</div>',
-            unsafe_allow_html=True,
+            else f"Selected team averages + custom players — {trend_title}"
         )
     else:
-        # Custom-player mode only appears when no team is selected. Nothing is
-        # preselected, so the trend tab always opens clean.
-        trend_scope_keys = eligible_player_keys(
-            bundle, start_date, end_date, TEAM_ORDER, selected_keys=None
-        )
-        comparison_options = sorted(
-            trend_scope_keys, key=lambda k: display_map.get(k, k)
-        )
-        trend_players = st.multiselect(
-            "Players to compare",
-            options=comparison_options,
-            default=[],
-            format_func=lambda k: display_map.get(k, k),
-            help="Select any players across the approved teams. Every player gets a separate line.",
-            key="trend_custom_players_none_default_v1",
-            placeholder="Select player(s)",
-        )
-        show_team_average = st.checkbox(
-            "Add their team average(s)",
-            value=False,
-            key="trend_custom_team_average_v2",
-        )
-        if show_team_average and trend_players:
-            history = bundle.get("history_calendar", pd.DataFrame())
-            trend_teams = ordered_teams(
-                history.loc[history["player_key"].isin(trend_players), "team"]
-                .dropna()
-                .unique()
-            ) if history is not None and not history.empty else []
-        else:
-            trend_teams = []
-        restrict_player_teams = None
         chart_title = f"Player Comparison — {trend_title}"
+
+    outside_seed_count = len(set(trend_players) - set(seeded_players))
+    hidden_seed_count = len(set(seeded_players) - set(trend_players))
+    st.markdown(
+        f'<div class="gps-subtle"><strong>{len(trend_players)} individual line(s)</strong> · '
+        f'{len(trend_selected_teams)} team average(s) · '
+        f'{hidden_seed_count} seeded player(s) hidden · {outside_seed_count} cross-team player(s) added</div>',
+        unsafe_allow_html=True,
+    )
 
     if not trend_players and not show_team_average:
         st.info("Select a team above or choose one or more players to compare.")
@@ -2570,7 +2594,7 @@ with player_tab:
                 show_team_average=show_team_average,
                 criteria=flag_criteria,
                 restrict_player_teams=restrict_player_teams,
-                show_legend=show_trend_legend,
+                legend_mode=legend_mode,
             ),
             use_container_width=True,
             config={
@@ -2580,7 +2604,6 @@ with player_tab:
             },
         )
 
-    # Keep the selected athlete rows visible under the plot for quick auditing.
     if trend_players:
         comparison_status = build_status_table(
             bundle, end_date, trend_players, criteria=flag_criteria
