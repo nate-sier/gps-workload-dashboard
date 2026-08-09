@@ -2474,17 +2474,37 @@ with player_tab:
         )
     trend_title, trend_unit, _ = metric_lookup[metric]
 
-    # Team mode: selecting any team automatically includes every eligible player
-    # on that team and overlays one team-average line per selected team.
+    # Team mode: selecting any team loads every eligible player by default, but
+    # the chart player list is independently filterable. Team averages always use
+    # the full eligible team population, even when individual player lines are hidden.
     if trend_selected_teams:
-        trend_players = []
+        all_team_players = []
         for team in trend_selected_teams:
-            trend_players.extend(
+            all_team_players.extend(
                 eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
             )
-        trend_players = sorted(
-            set(trend_players), key=lambda k: display_map.get(k, k)
+        all_team_players = sorted(
+            set(all_team_players), key=lambda k: display_map.get(k, k)
         )
+
+        team_key_suffix = "_".join(
+            re.sub(r"[^a-z0-9]+", "_", str(t).casefold()).strip("_")
+            for t in trend_selected_teams
+        ) or "none"
+        trend_players = st.multiselect(
+            "Players shown on chart",
+            options=all_team_players,
+            default=all_team_players,
+            format_func=lambda k: display_map.get(k, k),
+            key=f"trend_team_players_{team_key_suffix}",
+            help=(
+                "All eligible position players are selected when you choose a team. "
+                "Remove any players you do not want plotted. The team-average line still "
+                "uses the full eligible team, so filtering player lines does not change the average."
+            ),
+            placeholder="Select player(s) to show",
+        )
+
         trend_teams = list(trend_selected_teams)
         show_team_average = True
         restrict_player_teams = list(trend_selected_teams)
@@ -2493,9 +2513,10 @@ with player_tab:
             if len(trend_selected_teams) <= 3
             else f"Selected Teams — {trend_title}"
         )
+        hidden_count = max(0, len(all_team_players) - len(trend_players))
         st.markdown(
-            f'<div class="gps-subtle"><strong>{len(trend_players)} players</strong> · '
-            f'{len(trend_selected_teams)} team(s) · all individual lines + team average(s)</div>',
+            f'<div class="gps-subtle"><strong>{len(trend_players)} of {len(all_team_players)} players shown</strong> · '
+            f'{hidden_count} hidden · {len(trend_selected_teams)} team(s) · full-team average(s) retained</div>',
             unsafe_allow_html=True,
         )
     else:
