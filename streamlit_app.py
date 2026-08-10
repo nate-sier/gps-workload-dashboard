@@ -3,13 +3,7 @@
 Washington Nationals — GPS Workload Dashboard (Streamlit)
 ==========================================================
 
-GitHub / Streamlit Community Cloud-ready version of the live GPS workload
-dashboard. It reads STATSports practice data plus roster/game sprint data from
-Google Sheets, supports team/player/date-range filtering, and can generate a
-PDF for the selected time period.
 
-Secrets are read from Streamlit's secrets manager or a local
-.streamlit/secrets.toml file. Never commit real credentials to GitHub.
 """
 
 from __future__ import annotations
