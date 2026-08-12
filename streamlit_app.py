@@ -2690,6 +2690,8 @@ with st.sidebar:
     else:
         start_date = end_date = date_value
 
+    # Report downloads are handled in the main Reports section below.
+
     all_player_keys = eligible_player_keys(bundle, start_date, end_date, teams, selected_keys=None)
     display_map = player_display_map(bundle)
     player_options = sorted(all_player_keys, key=lambda k: display_map.get(k, k))
@@ -2848,69 +2850,148 @@ st.markdown(
 )
 
 # Reports use the supplied standalone structure: one team, one report date,
-# full current Master Roster. Dashboard player/date-range filters do not alter
-# the report roster or page structure; the selected END date is the report date.
-report_signature = (
-    str(end_date),
-    tuple(sorted(teams or [])),
-    bundle.get("loaded_at"),
+# full current Master Roster. Dashboard player filters do not alter report rosters.
+st.markdown("### Reports")
+st.caption(
+    "Build the bulk team reports, then use the selector immediately underneath to download one affiliate PDF."
 )
-if st.session_state.get("report_signature") != report_signature:
-    st.session_state.pop("exact_report_artifacts", None)
-    st.session_state["report_signature"] = report_signature
 
-report_col, note_col = st.columns([1, 3])
-with report_col:
-    if st.button("Build team report(s)", type="primary", use_container_width=True):
-        with st.spinner("Building original-format report(s)…"):
-            try:
-                st.session_state["exact_report_artifacts"] = build_exact_reports(
-                    bundle, teams or [], end_date
-                )
-            except Exception as exc:
-                st.session_state.pop("exact_report_artifacts", None)
-                st.error(f"Report build failed: {exc}")
-with note_col:
-    st.caption(
-        "Reports match the supplied standalone GPS reporting structure: one affiliate per report, "
-        "the full current Python Reports → Master Roster for that affiliate, Daily Snapshot, then "
-        "one GPS trend page per position player. The selected end date is used as the report date. "
-        "Report flags use the fixed supplied gps_flags.py rules; dashboard slider changes do not rewrite the official report logic."
+# Keep the bulk build tied to the sidebar selection. If nothing is selected,
+# fall back to the full organization so report controls remain usable.
+bulk_report_teams = ordered_teams(teams or TEAM_ORDER)
+report_date_label = pd.Timestamp(end_date).strftime('%b %d, %Y')
+
+st.caption(
+    f"Bulk build teams: {', '.join(bulk_report_teams)} · Report date: {report_date_label}"
+)
+
+# Primary bulk build action.
+if st.button(
+    "Build Team Reports",
+    type="primary",
+    use_container_width=True,
+    key="build_team_reports_v6_20260812_1703",
+):
+    with st.spinner("Building team PDFs…"):
+        try:
+            built = build_exact_reports(bundle, bulk_report_teams, end_date)
+            if built["mode"] == "single":
+                results = [built["result"]]
+                errors = built.get("errors", [])
+            else:
+                results = built.get("results", [])
+                errors = built.get("errors", [])
+
+            team_results = {
+                r["team"]: r for r in results
+                if r.get("pdf_bytes") is not None
+            }
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for team_name, result in team_results.items():
+                    zf.writestr(result["pdf_name"], result["pdf_bytes"])
+                if errors:
+                    zf.writestr("report_errors.txt", "\n".join(errors))
+
+            st.session_state["team_reports_artifact_v6"] = {
+                "teams": tuple(bulk_report_teams),
+                "date": str(end_date),
+                "team_results": team_results,
+                "zip_bytes": zip_buffer.getvalue(),
+                "zip_name": f"GPS_Workload_Reports_{pd.Timestamp(end_date).strftime('%Y-%m-%d')}.zip",
+                "errors": errors,
+            }
+            st.success(f"Built {len(team_results)} team PDF report(s).")
+        except Exception as exc:
+            st.session_state.pop("team_reports_artifact_v6", None)
+            st.error(f"Team report build failed: {exc}")
+
+# IMPORTANT: this box is deliberately immediately below Build Team Reports.
+# It is always rendered and is independent of the dashboard's player filter.
+with st.container(border=True):
+    st.markdown("#### TEAM REPORT DOWNLOAD")
+    st.caption("Choose the affiliate whose PDF you want to download.")
+    report_download_team = st.selectbox(
+        "Team",
+        options=TEAM_ORDER.copy(),
+        index=TEAM_ORDER.index(bulk_report_teams[0]) if bulk_report_teams and bulk_report_teams[0] in TEAM_ORDER else 0,
+        key="report_download_team_v6_20260812_1703",
     )
 
-artifacts = st.session_state.get("exact_report_artifacts")
-if artifacts:
-    if artifacts.get("errors"):
-        st.warning("Some team reports failed: " + " | ".join(artifacts["errors"]))
-    if artifacts["mode"] == "single":
-        result = artifacts["result"]
-        dl_pdf, dl_html = st.columns(2)
-        with dl_pdf:
-            if result["pdf_bytes"] is not None:
-                st.download_button(
-                    "Download report PDF",
-                    data=result["pdf_bytes"],
-                    file_name=result["pdf_name"],
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            else:
-                st.warning("Chromium PDF rendering was unavailable; use the HTML report's Print / PDF button.")
-        with dl_html:
-            st.download_button(
-                "Download report HTML",
-                data=result["html_bytes"],
-                file_name=result["html_name"],
-                mime="text/html",
-                use_container_width=True,
-            )
-    else:
+    artifact = st.session_state.get("team_reports_artifact_v6")
+    selected_result = None
+    if artifact and artifact.get("date") == str(end_date):
+        selected_result = artifact.get("team_results", {}).get(report_download_team)
+
+    # If this team was not part of the bulk build, allow building just this one
+    # directly from the same selector rather than forcing sidebar changes.
+    if selected_result is None:
+        if st.button(
+            f"Build {report_download_team} PDF",
+            use_container_width=True,
+            key="build_selected_team_pdf_v6_20260812_1703",
+        ):
+            with st.spinner(f"Building {report_download_team} PDF…"):
+                try:
+                    one = build_exact_reports(bundle, [report_download_team], end_date)
+                    if one["mode"] == "single":
+                        selected_result = one["result"]
+                    else:
+                        matches = [r for r in one.get("results", []) if r.get("team") == report_download_team]
+                        selected_result = matches[0] if matches else None
+                    if selected_result and selected_result.get("pdf_bytes") is not None:
+                        st.session_state["single_team_report_v6"] = {
+                            "team": report_download_team,
+                            "date": str(end_date),
+                            "result": selected_result,
+                        }
+                        st.success(f"{report_download_team} PDF is ready below.")
+                    else:
+                        st.error(f"{report_download_team} PDF could not be created.")
+                except Exception as exc:
+                    st.error(f"{report_download_team} report build failed: {exc}")
+
+        cached_one = st.session_state.get("single_team_report_v6")
+        if (
+            cached_one
+            and cached_one.get("team") == report_download_team
+            and cached_one.get("date") == str(end_date)
+        ):
+            selected_result = cached_one.get("result")
+
+    if selected_result and selected_result.get("pdf_bytes") is not None:
         st.download_button(
-            "Download team reports ZIP",
-            data=artifacts["zip_bytes"],
-            file_name=artifacts["zip_name"],
-            mime="application/zip",
+            f"Download {report_download_team} PDF",
+            data=selected_result["pdf_bytes"],
+            file_name=selected_result["pdf_name"],
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_selected_team_pdf_v6_20260812_1703",
         )
+    else:
+        st.caption(
+            "Either click Build Team Reports above, or click the selected team's Build PDF button here."
+        )
+
+artifact = st.session_state.get("team_reports_artifact_v6")
+if artifact and artifact.get("date") == str(end_date) and artifact.get("zip_bytes"):
+    st.download_button(
+        "Download Bulk Team Reports (ZIP)",
+        data=artifact["zip_bytes"],
+        file_name=artifact["zip_name"],
+        mime="application/zip",
+        use_container_width=True,
+        key="download_all_team_reports_zip_v6_20260812_1703",
+    )
+    if artifact.get("errors"):
+        st.warning("Some team reports failed: " + " | ".join(artifact["errors"]))
+
+st.caption("REPORT UI BUILD: 2026-08-12 17:03 ET · selector directly under Build Team Reports")
+st.caption(
+    "Reports use the supplied standalone GPS reporting structure and the current Python Reports → Master Roster. "
+    "The selected end date is used as the report date."
+)
 
 if not keys:
     st.warning("No players match the selected filters.")
@@ -3196,4 +3277,3 @@ st.caption(
     "Active flagging criteria: "
     + (" · ".join(active_criteria_parts) if active_criteria_parts else "No optional flag criteria enabled.")
 )
-
