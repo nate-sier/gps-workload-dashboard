@@ -93,28 +93,74 @@ ALLOW_LOCAL_EXCEL_FALLBACK = os.getenv("ALLOW_LOCAL_EXCEL_FALLBACK", "1") != "0"
 
 
 # =============================================================================
-# STATUS SETTINGS — easy to tune later
+# STATUS SETTINGS — standalone GPS report flag engine defaults
 # =============================================================================
 
-REVIEW_ACWR = 1.50
-MONITOR_ACWR = 1.30
-LOW_ACWR = 0.80
+# ACWR zones. ACWR is an EWMA 7:28 ratio computed from PP_Sprint max-effort
+# game distance, stepping once per game appearance rather than once per calendar day.
+ACWR_OPTIMAL_LOW = 0.80
+ACWR_ELEVATED = 1.30
+ACWR_HIGH_RISK = 1.50
+LAMBDA_ACUTE = 2 / (7 + 1)
+LAMBDA_CHRONIC = 2 / (28 + 1)
+
+# Same-day position-group z-score thresholds for Sprint Distance, HSR, Total Distance.
 REVIEW_Z = 2.00
 MONITOR_Z = 1.50
-SPRINT_EXPOSURE_GAP_DAYS = 5
+MIN_GROUP_SIZE = 4
+
+# 14-day rolling position-group baselines for Sprints and Accelerations.
+ROLLING_WINDOW_DAYS = 14
+ROLLING_MIN_SESSIONS = 3
+ROLLING_REVIEW_Z = 2.00
+ROLLING_MONITOR_Z = 1.50
+ROLLING_MIN_DELTA_SPRINTS = 3.0
+ROLLING_MIN_DELTA_ACCELS = 5.0
+
+# Sprint / HSR exposure rules.
+MEANINGFUL_SPRINT_THRESHOLD = 1.0
+MEANINGFUL_SPRINT_DIST_M = 10.0
+MEANINGFUL_HSR_THRESHOLD_M = 20.0
+MAX_DAYS_WITHOUT_SPRINT = 3
+MAX_DAYS_WITHOUT_HSR = 3
+LOW_7DAY_SPRINT_DIST_M = 30.0
+LOW_7DAY_HSR_M = 50.0
+GAME_MIN_PRIOR = 3
+
+# (column, display label, unit, flag enabled, flag mode)
+FLAG_METRICS = [
+    ("top_speed_ms", "Top Speed", "m/s", False, False),
+    ("n_sprints", "Sprints", "", True, "rolling_pct"),
+    ("sprint_distance_m", "Sprint Dist", "m", True, "zscore"),
+    ("n_accelerations", "Accels", "#", True, "rolling_pct"),
+    ("hsr_distance_m", "HSR", "m", True, "zscore"),
+    ("total_distance_m", "Total Dist", "m", True, "zscore"),
+    ("duration_min", "Duration", "min", False, False),
+]
 
 DEFAULT_FLAG_CRITERIA = {
-    "review_acwr": REVIEW_ACWR,
-    "monitor_acwr": MONITOR_ACWR,
-    "low_acwr": LOW_ACWR,
+    "review_acwr": ACWR_HIGH_RISK,
+    "monitor_acwr": ACWR_ELEVATED,
+    "optimal_low_acwr": ACWR_OPTIMAL_LOW,
     "review_z": REVIEW_Z,
     "monitor_z": MONITOR_Z,
-    "sprint_gap_days": SPRINT_EXPOSURE_GAP_DAYS,
-    "use_high_acwr": True,
-    "use_hsr_z": True,
-    "use_accel_z": True,
-    "use_sprint_gap": True,
-    "use_low_acwr": True,
+    "rolling_review_z": ROLLING_REVIEW_Z,
+    "rolling_monitor_z": ROLLING_MONITOR_Z,
+    "rolling_window_days": ROLLING_WINDOW_DAYS,
+    "rolling_min_sessions": ROLLING_MIN_SESSIONS,
+    "rolling_min_delta_sprints": ROLLING_MIN_DELTA_SPRINTS,
+    "rolling_min_delta_accels": ROLLING_MIN_DELTA_ACCELS,
+    "meaningful_sprint_threshold": MEANINGFUL_SPRINT_THRESHOLD,
+    "meaningful_sprint_dist_m": MEANINGFUL_SPRINT_DIST_M,
+    "meaningful_hsr_m": MEANINGFUL_HSR_THRESHOLD_M,
+    "max_days_without_sprint": MAX_DAYS_WITHOUT_SPRINT,
+    "max_days_without_hsr": MAX_DAYS_WITHOUT_HSR,
+    "low_7d_sprint_dist_m": LOW_7DAY_SPRINT_DIST_M,
+    "low_7d_hsr_m": LOW_7DAY_HSR_M,
+    "use_acwr": True,
+    "use_gps_flags": True,
+    "use_combined_load": True,
+    "use_exposure_flags": True,
 }
 
 # Any of these are removed from practice totals to reduce obvious double-counting.
@@ -980,53 +1026,76 @@ def clean_games(pp: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def add_practice_peer_zscores(daily: pd.DataFrame) -> pd.DataFrame:
+
+def add_game_flag_context(games_daily: pd.DataFrame) -> pd.DataFrame:
+    """Add standalone-report game-load classes and running EWMA ACWR.
+
+    Game load is classified against each athlete's OWN expanding prior-game
+    baseline. ACWR is calculated from max-effort game distance with 7- and
+    28-observation EWMA smoothing, stepping on game appearances only.
     """
-    Add leave-one-out same-practice peer z-scores for GPS workload metrics.
-
-    Each athlete is compared with the OTHER position players from the same
-    team on the same practice date. Game-only rows and athletes without a GPS
-    practice observation that day are excluded from the peer baseline.
-
-    A minimum of 3 peers (4 total observed position players) is required.
-    """
-    out = daily.copy()
-    out["hsr_peer_z"] = np.nan
-    out["accel_peer_z"] = np.nan
-    out["practice_peer_n"] = 0
-
-    if out.empty:
+    if games_daily is None or games_daily.empty:
+        out = games_daily.copy() if isinstance(games_daily, pd.DataFrame) else pd.DataFrame()
+        if "game_load_class" not in out.columns:
+            out["game_load_class"] = pd.Series(dtype=object)
+        if "game_acwr" not in out.columns:
+            out["game_acwr"] = pd.Series(dtype=float)
         return out
 
-    eligible = safe_num(out.get("practice_observed", pd.Series(0, index=out.index)), fill=0) > 0
-    eligible &= out.get("team", pd.Series("", index=out.index)).isin(ALLOWED_TEAMS)
+    out = games_daily.copy().sort_values(["player_key", "date"]).reset_index(drop=True)
+    out["game_load_class"] = "—"
+    out["game_acwr"] = np.nan
 
-    metric_map = [
-        ("hsr_distance_m", "hsr_peer_z"),
-        ("n_accelerations", "accel_peer_z"),
-    ]
-
-    observed = out.loc[eligible]
-    for (_, _), idx in observed.groupby(["date", "team"], dropna=False).groups.items():
+    for key, idx in out.groupby("player_key", sort=False).groups.items():
         idx = list(idx)
-        if len(idx) < 4:
-            continue
-        out.loc[idx, "practice_peer_n"] = len(idx) - 1
+        grp = out.loc[idx].sort_values("date")
 
-        for metric, zcol in metric_map:
-            vals = safe_num(out.loc[idx, metric])
-            for row_idx in idx:
-                value = vals.loc[row_idx]
-                if pd.isna(value):
-                    continue
-                peers = vals.drop(index=row_idx).dropna()
-                if len(peers) < 3:
-                    continue
-                peer_sd = peers.std(ddof=1)
-                if pd.notna(peer_sd) and peer_sd > 0:
-                    out.at[row_idx, zcol] = (float(value) - float(peers.mean())) / float(peer_sd)
+        runs = safe_num(grp["game_max_effort_runs"])
+        dist = safe_num(grp["game_max_effort_distance_yards"])
+        prior_run_mean = runs.shift(1).expanding().mean()
+        prior_run_sd = runs.shift(1).expanding().std().replace(0, np.nan)
+        prior_dist_mean = dist.shift(1).expanding().mean()
+        prior_dist_sd = dist.shift(1).expanding().std().replace(0, np.nan)
 
-    return out
+        acute = None
+        chronic = None
+        for prior_n, row_idx in enumerate(grp.index):
+            r = runs.loc[row_idx]
+            d = dist.loc[row_idx]
+
+            if prior_n >= GAME_MIN_PRIOR:
+                high_run = (
+                    pd.notna(r) and pd.notna(prior_run_sd.loc[row_idx])
+                    and r >= prior_run_mean.loc[row_idx] + prior_run_sd.loc[row_idx]
+                )
+                high_dist = (
+                    pd.notna(d) and pd.notna(prior_dist_sd.loc[row_idx])
+                    and d >= prior_dist_mean.loc[row_idx] + prior_dist_sd.loc[row_idx]
+                )
+                low_run = (
+                    pd.isna(r) or pd.isna(prior_run_sd.loc[row_idx])
+                    or r <= prior_run_mean.loc[row_idx] - prior_run_sd.loc[row_idx]
+                )
+                low_dist = (
+                    pd.isna(d) or pd.isna(prior_dist_sd.loc[row_idx])
+                    or d <= prior_dist_mean.loc[row_idx] - prior_dist_sd.loc[row_idx]
+                )
+                if high_run or high_dist:
+                    out.at[row_idx, "game_load_class"] = "High"
+                elif low_run and low_dist:
+                    out.at[row_idx, "game_load_class"] = "Low"
+                else:
+                    out.at[row_idx, "game_load_class"] = "Moderate"
+
+            load = float(d) if pd.notna(d) else 0.0
+            if acute is None:
+                acute = chronic = load
+            else:
+                acute = load * LAMBDA_ACUTE + acute * (1 - LAMBDA_ACUTE)
+                chronic = load * LAMBDA_CHRONIC + chronic * (1 - LAMBDA_CHRONIC)
+            out.at[row_idx, "game_acwr"] = acute / chronic if chronic and chronic > 0 else np.nan
+
+    return out.sort_values(["player_key", "date"]).reset_index(drop=True)
 
 
 def combine_daily(practice_daily: pd.DataFrame, games_daily: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
@@ -1106,15 +1175,19 @@ def combine_daily(practice_daily: pd.DataFrame, games_daily: pd.DataFrame, roste
         if pitcher_keys:
             d = d[~d["player_key"].isin(pitcher_keys)].copy()
 
-    # GPS flags are peer-relative: compare each athlete with the OTHER position
-    # players in the same team practice on that date.
-    d = add_practice_peer_zscores(d)
-
+    # Flag calculations are intentionally deferred to compute_flag_snapshot(),
+    # which reproduces the standalone report's Team + Position grouping,
+    # rolling baselines, minimum deltas, and status priority order.
     return d.sort_values(["player_key", "date"]).reset_index(drop=True)
 
 
 def build_history_calendar(daily: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
-    """Expand each player to calendar days so 7:28 load ratios include zero-load days."""
+    """Expand athletes to calendar days for charting while preserving event-based ACWR.
+
+    The standalone report's ACWR advances only on game appearances. Calendar
+    rows therefore carry the most recent game EWMA forward for snapshot context;
+    ACWR trend charts later filter back to actual game-observed dates.
+    """
     if daily.empty:
         return pd.DataFrame()
 
@@ -1132,7 +1205,6 @@ def build_history_calendar(daily: pd.DataFrame, roster: pd.DataFrame) -> pd.Data
         base["player_key"] = key
         merged = base.merge(grp, on=["player_key", "date"], how="left")
 
-        # Keep player metadata available on zero-load days.
         merged["player_name"] = merged.get("player_name", pd.Series("", index=merged.index)).fillna("").astype(str)
         if merged["player_name"].replace("", np.nan).notna().any():
             display = merged.loc[merged["player_name"].ne(""), "player_name"].iloc[-1]
@@ -1152,29 +1224,30 @@ def build_history_calendar(daily: pd.DataFrame, roster: pd.DataFrame) -> pd.Data
             "mechanical_load", "duration_min", "practice_observed", "game_days",
             "game_max_effort_runs", "game_max_effort_distance_yards", "game_distance_yards",
             "game_distance_m", "game_max_effort_distance_m", "combined_total_distance_m",
-            "combined_high_intensity_m", "game_observed", "activity_observed", "practice_peer_n",
+            "combined_high_intensity_m", "game_observed", "activity_observed",
         ]
         for c in fill_zero:
             if c not in merged.columns:
                 merged[c] = 0.0
             merged[c] = safe_num(merged[c], fill=0)
 
-        for c in ["top_speed_ms", "max_accel_ms2", "hsr_peer_z", "accel_peer_z"]:
+        for c in ["top_speed_ms", "max_accel_ms2", "game_acwr"]:
             if c not in merged.columns:
                 merged[c] = np.nan
             merged[c] = safe_num(merged[c])
 
-        # ACWR is STRICTLY PP_Sprint game load. Practice GPS does not contribute.
-        # PP_Sprint distance_covered_yards is converted to game_distance_m above;
-        # the ratio is therefore based only on rolling game total-distance load.
-        acute7 = merged["game_distance_m"].rolling(7, min_periods=1).sum()
-        chronic28 = merged["game_distance_m"].rolling(28, min_periods=7).sum() / 4.0
-        merged["acwr"] = np.where(chronic28 > 0, acute7 / chronic28, np.nan)
+        if "game_load_class" not in merged.columns:
+            merged["game_load_class"] = ""
+        merged["game_load_class"] = merged["game_load_class"].fillna("").astype(str)
 
+        # Carry the event-based value for snapshot context only. Trend plotting
+        # filters ACWR to game-observed rows so this does not create a fake daily series.
+        merged["acwr"] = merged["game_acwr"].ffill()
         pieces.append(merged)
 
     out = pd.concat(pieces, ignore_index=True)
     return out.sort_values(["player_key", "date"]).reset_index(drop=True)
+
 
 
 def refresh_data():
@@ -1183,7 +1256,7 @@ def refresh_data():
         practice_raw, roster_raw, pp_raw, source = load_source_frames()
         roster = clean_roster(roster_raw)
         raw_practice, practice_daily = clean_practice(practice_raw, roster)
-        games_daily = clean_games(pp_raw, roster)
+        games_daily = add_game_flag_context(clean_games(pp_raw, roster))
         daily = combine_daily(practice_daily, games_daily, roster)
         history = build_history_calendar(daily, roster)
 
@@ -1293,177 +1366,423 @@ def player_display_map(bundle):
 
 
 # =============================================================================
-# STATUS + SUMMARY LOGIC
+# STATUS + SUMMARY LOGIC — integrated standalone report flag engine
 # =============================================================================
 
-def _last_sprint_date(history: pd.DataFrame, end: pd.Timestamp):
-    sprint_mask = (
-        (history["n_sprints"] > 0)
-        | (history["sprint_distance_m"] > 0)
-        | (history["game_max_effort_runs"] > 0)
-    )
-    vals = history.loc[sprint_mask & (history["date"] <= end), "date"]
-    return vals.max() if not vals.empty else pd.NaT
-
-
 def _last_game_row(history: pd.DataFrame, end: pd.Timestamp):
-    rows = history[(history["date"] <= end) & (history["game_observed"] > 0)].sort_values("date")
+    if history is None or history.empty:
+        return None
+    rows = history[(history["date"] <= end) & (safe_num(history.get("game_observed", pd.Series(0, index=history.index)), 0) > 0)].sort_values("date")
     return rows.iloc[-1] if not rows.empty else None
 
 
-def classify_status(today, last_sprint_days, criteria=None):
-    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
-
-    # Data availability wins first, matching the daily-report concept.
-    if today is None or int(today.get("activity_observed", 0)) == 0:
-        return "Data Check", "No GPS/game session"
-
-    acwr = today.get("acwr", np.nan)
-    hz = today.get("hsr_peer_z", np.nan)
-    az = today.get("accel_peer_z", np.nan)
-
-    if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["review_acwr"]:
-        return "Review", f"ACWR {acwr:.2f}"
-    if criteria["use_hsr_z"] and pd.notna(hz) and abs(float(hz)) >= criteria["review_z"]:
-        direction = "high" if hz > 0 else "low"
-        return "Review", f"HSR {direction} vs practice ({hz:+.1f} z)"
-    if criteria["use_accel_z"] and pd.notna(az) and abs(float(az)) >= criteria["review_z"]:
-        direction = "high" if az > 0 else "low"
-        return "Review", f"Accelerations {direction} vs practice ({az:+.1f} z)"
-
-    if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["monitor_acwr"]:
-        return "Monitor", f"ACWR {acwr:.2f}"
-    if criteria["use_hsr_z"] and pd.notna(hz) and abs(float(hz)) >= criteria["monitor_z"]:
-        direction = "high" if hz > 0 else "low"
-        return "Monitor", f"HSR {direction} vs practice ({hz:+.1f} z)"
-    if criteria["use_accel_z"] and pd.notna(az) and abs(float(az)) >= criteria["monitor_z"]:
-        direction = "high" if az > 0 else "low"
-        return "Monitor", f"Accelerations {direction} vs practice ({az:+.1f} z)"
-
-    if criteria["use_sprint_gap"] and (
-        last_sprint_days is None or last_sprint_days > criteria["sprint_gap_days"]
-    ):
-        label = "No sprint history" if last_sprint_days is None else f"{last_sprint_days} days since sprint"
-        return "Needs Exposure", label
-    if criteria["use_low_acwr"] and pd.notna(acwr) and acwr < criteria["low_acwr"]:
-        return "Needs Exposure", f"Low ACWR {acwr:.2f}"
-
-    return "Prepared", "Normal workload"
-
-
-def combined_load_label(today, last_game, criteria=None):
-    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
-    acwr = today.get("acwr", np.nan) if today is not None else np.nan
-    practice = today.get("total_distance_m", 0) if today is not None else 0
-    game_runs = today.get("game_max_effort_runs", 0) if today is not None else 0
-    game_dist = today.get("game_max_effort_distance_yards", 0) if today is not None else 0
-
-    if game_runs >= 5 or game_dist >= 150:
+def classify_combined_load(practice_level, game_load_class):
+    """Exact combined-load matrix from the standalone GPS workload report."""
+    gl = game_load_class if game_load_class in ("High", "Moderate", "Low") else "Low"
+    if practice_level == "High" and gl == "High":
+        return "Major Load Concern"
+    if practice_level == "High":
+        return "Practice-Driven Spike"
+    if practice_level == "Moderate" and gl == "High":
         return "Game-Driven Load"
-    if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["review_acwr"]:
-        return "High / Review"
-    if criteria["use_high_acwr"] and pd.notna(acwr) and acwr >= criteria["monitor_acwr"]:
-        return "High / Monitor"
-    if criteria["use_low_acwr"] and pd.notna(acwr) and acwr < criteria["low_acwr"]:
-        return "Possible Underload"
-    if practice > 0:
+    if practice_level == "Moderate":
         return "Normal / Monitor"
-    if last_game is not None:
+    if practice_level == "Low" and gl == "High":
         return "Game-Driven Load"
-    return "No Current Load"
+    if practice_level == "Low" and gl == "Moderate":
+        return "Normal / Monitor"
+    return "Possible Underload"
 
 
-def build_status_table(bundle, end_date, player_keys, criteria=None) -> pd.DataFrame:
-    history = bundle["history_calendar"]
-    roster = bundle["roster"]
-    if history.empty or not player_keys:
-        return pd.DataFrame()
+def _last_nonblank(series, default=""):
+    if series is None:
+        return default
+    vals = pd.Series(series).dropna().astype(str).str.strip()
+    vals = vals[vals.ne("")]
+    return vals.iloc[-1] if not vals.empty else default
 
+
+def compute_flag_snapshot(bundle, end_date, player_keys, criteria=None) -> pd.DataFrame:
+    """Reproduce gps_flags.compute_athlete_windows() inside the Streamlit app.
+
+    This keeps the dashboard self-contained for GitHub/Streamlit Cloud while
+    preserving the standalone report's actual flag math:
+      * Team + Position same-day z-scores for Sprint Dist, HSR, Total Dist.
+      * 14-day Team + Position rolling baselines for Sprints/Accelerations.
+      * Positive spikes only; rolling minimum absolute deltas still apply.
+      * Sprint/HSR exposure combines practice GPS and PP_Sprint max-effort runs.
+      * Roster athletes with no GPS on the end date remain visible as Data Check.
+    """
+    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
     end = pd.Timestamp(end_date).normalize()
+    cut7 = end - pd.Timedelta(days=7)
+    cut28 = end - pd.Timedelta(days=28)
+    cutrolling = end - pd.Timedelta(days=int(criteria["rolling_window_days"]))
+
+    practice = bundle.get("practice_daily", pd.DataFrame()).copy()
+    games = bundle.get("games_daily", pd.DataFrame()).copy()
+    roster = bundle.get("roster", pd.DataFrame()).copy()
     display = player_display_map(bundle)
+
+    if not practice.empty:
+        practice["date"] = pd.to_datetime(practice["date"], errors="coerce").dt.normalize()
+    if not games.empty:
+        games["date"] = pd.to_datetime(games["date"], errors="coerce").dt.normalize()
+
     roster_team = roster.set_index("player_key")["roster_team"].to_dict() if not roster.empty else {}
     roster_pos = roster.set_index("player_key")["position"].to_dict() if not roster.empty else {}
 
-    rows = []
+    metric_cols = [m[0] for m in FLAG_METRICS]
+    records = []
+
     for key in player_keys:
-        grp = history[(history["player_key"] == key) & (history["date"] <= end)].sort_values("date")
-        if grp.empty:
-            rows.append({
-                "Player Key": key,
-                "Athlete": display.get(key, key),
-                "Team": roster_team.get(key, ""),
-                "Pos": roster_pos.get(key, ""),
-                "Status": "Data Check",
-                "Primary Driver": "No data history",
-                "Combined Load": "No Current Load",
-                "ACWR": np.nan,
-                "Last Game Load": "—",
-                "Practice Load (Prev Day)": "—",
-                "Last Sprint": "no history",
-            })
-            continue
+        p_all = practice[(practice["player_key"] == key) & (practice["date"] <= end)].sort_values("date") if not practice.empty else pd.DataFrame()
+        p_today = p_all[p_all["date"] == end] if not p_all.empty else pd.DataFrame()
+        p_prior = p_all[p_all["date"] < end] if not p_all.empty else pd.DataFrame()
+        p_prior7 = p_prior[p_prior["date"] >= cut7] if not p_prior.empty else pd.DataFrame()
+        p_prior28 = p_prior[p_prior["date"] >= cut28] if not p_prior.empty else pd.DataFrame()
+        prow = p_today.iloc[-1] if not p_today.empty else None
 
-        today_rows = grp[grp["date"] == end]
-        today = today_rows.iloc[-1] if not today_rows.empty else None
+        g_all = games[(games["player_key"] == key) & (games["date"] <= end)].sort_values("date") if not games.empty else pd.DataFrame()
+        grow = g_all.iloc[-1] if not g_all.empty else None
 
-        last_sprint = _last_sprint_date(grp, end)
-        last_sprint_days = None if pd.isna(last_sprint) else int((end - last_sprint).days)
-        status, driver = classify_status(today, last_sprint_days, criteria=criteria)
-        last_game = _last_game_row(grp, end)
+        team = str(prow.get("practice_team", "") if prow is not None else "").strip()
+        if not team and not p_all.empty:
+            team = _last_nonblank(p_all.get("practice_team", pd.Series(dtype=str)))
+        if not team and grow is not None:
+            team = str(grow.get("game_team", "") or "").strip()
+        team = clean_team(team or roster_team.get(key, ""))
 
-        team = ""
-        pos = ""
-        if today is not None:
-            team = str(today.get("team", "") or "")
-            pos = str(today.get("position", "") or "")
-        if not team:
-            nonblank = grp["team"].dropna().astype(str)
-            nonblank = nonblank[nonblank.str.strip().ne("")]
-            team = nonblank.iloc[-1] if not nonblank.empty else roster_team.get(key, "")
-        if not pos:
-            nonblank = grp["position"].dropna().astype(str)
-            nonblank = nonblank[nonblank.str.strip().ne("")]
-            pos = nonblank.iloc[-1] if not nonblank.empty else roster_pos.get(key, "")
+        pos = str(prow.get("position", "") if prow is not None else "").strip()
+        if not pos and not p_all.empty:
+            pos = _last_nonblank(p_all.get("position", pd.Series(dtype=str)))
+        pos = pos or roster_pos.get(key, "")
 
-        if last_game is None:
-            last_game_label = "—"
-        else:
-            last_game_label = (
-                f"{int(round(last_game.get('game_max_effort_runs', 0)))} / "
-                f"{int(round(last_game.get('game_max_effort_distance_yards', 0)))} yd"
-            )
-
-        prev = grp[grp["date"] == end - pd.Timedelta(days=1)]
-        if prev.empty or int(prev.iloc[-1].get("practice_observed", 0)) == 0:
-            prev_label = "—"
-        else:
-            pr = prev.iloc[-1]
-            prev_label = (
-                f"{int(round(pr.get('n_accelerations', 0)))} acc / "
-                f"{int(round(pr.get('n_sprints', 0)))} spr / "
-                f"{int(round(pr.get('hsr_distance_m', 0)))} m HSR"
-            )
-
-        acwr = today.get("acwr", np.nan) if today is not None else np.nan
-        rows.append({
+        rec = {
             "Player Key": key,
             "Athlete": display.get(key, key),
             "Team": team,
             "Pos": pos,
+            "has_gps": prow is not None,
+            "flag_count": 0,
+        }
+
+        for col, short, unit, *_ in FLAG_METRICS:
+            val = pd.to_numeric(prow.get(col), errors="coerce") if prow is not None else np.nan
+            avg7 = safe_num(p_prior7[col]).mean() if (not p_prior7.empty and col in p_prior7.columns) else np.nan
+            avg28 = safe_num(p_prior28[col]).mean() if (not p_prior28.empty and col in p_prior28.columns) else np.nan
+            rec[f"{col}_val"] = round(float(val), 1) if pd.notna(val) else np.nan
+            rec[f"{col}_7d"] = round(float(avg7), 1) if pd.notna(avg7) else np.nan
+            rec[f"{col}_28d"] = round(float(avg28), 1) if pd.notna(avg28) else np.nan
+            rec[f"{col}_flag"] = None
+            rec[f"{col}_z"] = np.nan
+
+        # Game context as-of the selected date.
+        rec["game_load_class"] = str(grow.get("game_load_class", "—")) if grow is not None else "—"
+        rec["acwr"] = pd.to_numeric(grow.get("game_acwr"), errors="coerce") if grow is not None else np.nan
+        rec["last_game_date"] = grow.get("date") if grow is not None else pd.NaT
+        rec["last_game_runs"] = float(pd.to_numeric(grow.get("game_max_effort_runs", 0), errors="coerce") or 0) if grow is not None else 0.0
+        rec["last_game_dist_yards"] = float(pd.to_numeric(grow.get("game_max_effort_distance_yards", 0), errors="coerce") or 0) if grow is not None else 0.0
+
+        # Practice exposure history.
+        sprint_count_thr = float(criteria["meaningful_sprint_threshold"])
+        sprint_dist_thr = float(criteria["meaningful_sprint_dist_m"])
+        hsr_thr = float(criteria["meaningful_hsr_m"])
+
+        today_sprints = pd.to_numeric(prow.get("n_sprints"), errors="coerce") if prow is not None else np.nan
+        today_sdist = pd.to_numeric(prow.get("sprint_distance_m"), errors="coerce") if prow is not None else np.nan
+        today_hsr = pd.to_numeric(prow.get("hsr_distance_m"), errors="coerce") if prow is not None else np.nan
+        today_has_sprint_gps = (
+            (pd.notna(today_sprints) and today_sprints >= sprint_count_thr)
+            or (pd.notna(today_sdist) and today_sdist >= sprint_dist_thr)
+        )
+        today_has_hsr_gps = pd.notna(today_hsr) and today_hsr >= hsr_thr
+
+        g_dates = set()
+        g_dist_by_date = {}
+        g_hsr_by_date = {}
+        if not g_all.empty:
+            for gd, ggrp in g_all.groupby("date"):
+                gd = pd.Timestamp(gd).normalize()
+                runs = float(safe_num(ggrp["game_max_effort_runs"], 0).sum())
+                dist_m = float(safe_num(ggrp["game_max_effort_distance_yards"], 0).sum()) * 0.9144
+                if runs >= 1:
+                    g_dates.add(gd)
+                g_dist_by_date[gd] = dist_m
+                g_hsr_by_date[gd] = dist_m
+
+        today_game_sprint = end in g_dates
+        today_game_dist = g_dist_by_date.get(end, 0.0)
+        today_game_hsr = g_hsr_by_date.get(end, 0.0)
+        today_has_sprint = today_has_sprint_gps or today_game_sprint
+        today_has_hsr = today_has_hsr_gps or today_game_hsr >= hsr_thr
+
+        if today_has_sprint:
+            rec["days_since_sprint"] = 0
+            rec["last_sprint_date"] = end
+        else:
+            gps_dates = set()
+            if not p_prior.empty:
+                pc = safe_num(p_prior.get("n_sprints", pd.Series(0, index=p_prior.index)), 0)
+                psd = safe_num(p_prior.get("sprint_distance_m", pd.Series(0, index=p_prior.index)), 0)
+                gps_dates = set(p_prior.loc[(pc >= sprint_count_thr) | (psd >= sprint_dist_thr), "date"].dt.normalize())
+            all_dates = gps_dates | {d for d in g_dates if d < end}
+            if all_dates:
+                last_date = max(all_dates)
+                rec["last_sprint_date"] = last_date
+                # Preserve the standalone report's one-day adjustment.
+                rec["days_since_sprint"] = max(0, int((end - last_date).days) - 1)
+            else:
+                rec["last_sprint_date"] = pd.NaT
+                rec["days_since_sprint"] = None
+
+        if today_has_hsr:
+            rec["days_since_hsr"] = 0
+        else:
+            gps_hsr_dates = set()
+            if not p_prior.empty:
+                ph = safe_num(p_prior.get("hsr_distance_m", pd.Series(0, index=p_prior.index)), 0)
+                gps_hsr_dates = set(p_prior.loc[ph >= hsr_thr, "date"].dt.normalize())
+            game_hsr_dates = {d for d, dist in g_hsr_by_date.items() if d < end and dist >= hsr_thr}
+            all_hsr_dates = gps_hsr_dates | game_hsr_dates
+            rec["days_since_hsr"] = int((end - max(all_hsr_dates)).days) if all_hsr_dates else None
+
+        # 7-day exposure totals. Match the standalone same-date guard for PRIOR
+        # game exposure so a date represented in practice GPS is not double counted.
+        prior7_dates = set(p_prior7["date"].dt.normalize()) if not p_prior7.empty else set()
+        p7_sprints = safe_num(p_prior7.get("n_sprints", pd.Series(dtype=float)), 0)
+        p7_sdist = safe_num(p_prior7.get("sprint_distance_m", pd.Series(dtype=float)), 0)
+        p7_hsr = safe_num(p_prior7.get("hsr_distance_m", pd.Series(dtype=float)), 0)
+        game7_sdist = 0.0
+        game7_hsr = 0.0
+        game7_sprint_days = 0
+        for gd, dist_m in g_dist_by_date.items():
+            if cut7 <= gd < end and gd not in prior7_dates:
+                if gd in g_dates:
+                    game7_sprint_days += 1
+                game7_sdist += dist_m
+                game7_hsr += g_hsr_by_date.get(gd, 0.0)
+        gps7_sprint_days = int(((p7_sprints >= sprint_count_thr) | (p7_sdist >= sprint_dist_thr)).sum())
+
+        rec["r7_sprint_days"] = gps7_sprint_days + game7_sprint_days + (1 if today_has_sprint else 0)
+        rec["r7_sprint_dist"] = float(p7_sdist.sum()) + game7_sdist + (float(today_sdist) if pd.notna(today_sdist) else 0.0) + today_game_dist
+        rec["r7_hsr"] = float(p7_hsr.sum()) + game7_hsr + (float(today_hsr) if pd.notna(today_hsr) else 0.0) + today_game_hsr
+        rec["today_has_sprint"] = today_has_sprint
+        rec["today_has_hsr"] = today_has_hsr
+        records.append(rec)
+
+    result = pd.DataFrame(records)
+    if result.empty or not criteria["use_gps_flags"]:
+        return result
+
+    # Pass 2: metric flags by Team + Position, matching gps_flags.py.
+    for (team, pos), grp_idx in result.groupby(["Team", "Pos"], dropna=False).groups.items():
+        grp_idx = list(grp_idx)
+        grp = result.loc[grp_idx]
+        n = len(grp)
+
+        hist_pos = practice[
+            (practice.get("practice_team", pd.Series("", index=practice.index)).apply(clean_team) == team)
+            & (practice.get("position", pd.Series("", index=practice.index)).astype(str) == str(pos))
+            & (practice["date"] >= cutrolling)
+            & (practice["date"] < end)
+        ] if not practice.empty else pd.DataFrame()
+
+        rolling_stats = {}
+        for col, short, unit, flag_enabled, flag_mode in FLAG_METRICS:
+            if flag_mode != "rolling_pct":
+                continue
+            vals = safe_num(hist_pos[col]).dropna() if (not hist_pos.empty and col in hist_pos.columns) else pd.Series(dtype=float)
+            if len(vals) >= int(criteria["rolling_min_sessions"]):
+                rolling_stats[col] = (float(vals.mean()), float(vals.std(ddof=1)))
+            else:
+                rolling_stats[col] = (np.nan, np.nan)
+
+        for col, short, unit, flag_enabled, flag_mode in FLAG_METRICS:
+            if not flag_enabled:
+                continue
+            val_col, flag_col, z_col = f"{col}_val", f"{col}_flag", f"{col}_z"
+
+            if flag_mode == "rolling_pct":
+                rmean, rsd = rolling_stats.get(col, (np.nan, np.nan))
+                min_delta = (
+                    float(criteria["rolling_min_delta_sprints"])
+                    if col == "n_sprints" else float(criteria["rolling_min_delta_accels"])
+                )
+                use_rolling = pd.notna(rmean) and pd.notna(rsd) and rsd > 0
+                if use_rolling:
+                    for idx in grp_idx:
+                        v = result.at[idx, val_col]
+                        if pd.isna(v):
+                            continue
+                        z = (v - rmean) / rsd
+                        result.at[idx, z_col] = round(float(z), 2)
+                        delta = v - rmean
+                        if z >= float(criteria["rolling_review_z"]) and delta >= min_delta:
+                            result.at[idx, flag_col] = "review"
+                            result.at[idx, "flag_count"] += 1
+                        elif z >= float(criteria["rolling_monitor_z"]) and delta >= min_delta:
+                            result.at[idx, flag_col] = "monitor"
+                            result.at[idx, "flag_count"] += 1
+                else:
+                    vals = safe_num(grp[val_col]).dropna()
+                    if n < MIN_GROUP_SIZE or len(vals) < MIN_GROUP_SIZE:
+                        continue
+                    mean, sd = vals.mean(), vals.std(ddof=1)
+                    if pd.isna(sd) or sd == 0:
+                        continue
+                    for idx in grp_idx:
+                        v = result.at[idx, val_col]
+                        if pd.isna(v):
+                            continue
+                        z = (v - mean) / sd
+                        result.at[idx, z_col] = round(float(z), 2)
+                        if z >= float(criteria["review_z"]):
+                            result.at[idx, flag_col] = "review"
+                            result.at[idx, "flag_count"] += 1
+                        elif z >= float(criteria["monitor_z"]):
+                            result.at[idx, flag_col] = "monitor"
+                            result.at[idx, "flag_count"] += 1
+            else:
+                vals = safe_num(grp[val_col]).dropna()
+                if n < MIN_GROUP_SIZE or len(vals) < MIN_GROUP_SIZE:
+                    continue
+                mean, sd = vals.mean(), vals.std(ddof=1)
+                if pd.isna(sd) or sd == 0:
+                    continue
+                for idx in grp_idx:
+                    v = result.at[idx, val_col]
+                    if pd.isna(v):
+                        continue
+                    z = (v - mean) / sd
+                    result.at[idx, z_col] = round(float(z), 2)
+                    if z >= float(criteria["review_z"]):
+                        result.at[idx, flag_col] = "review"
+                        result.at[idx, "flag_count"] += 1
+                    elif z >= float(criteria["monitor_z"]):
+                        result.at[idx, flag_col] = "monitor"
+                        result.at[idx, "flag_count"] += 1
+
+    return result
+
+
+def classify_status_from_snapshot(row, criteria=None):
+    """Return status, driver, action, combined load and practice level."""
+    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
+    flags = {col: row.get(f"{col}_flag") for col, *_ in FLAG_METRICS}
+    has_review = any(v == "review" for v in flags.values())
+    has_monitor = any(v == "monitor" for v in flags.values())
+    practice_level = "High" if has_review else ("Moderate" if has_monitor else "Low")
+    game_class = row.get("game_load_class", "—")
+    combined = classify_combined_load(practice_level, game_class)
+    acwr = pd.to_numeric(row.get("acwr"), errors="coerce")
+
+    if not bool(row.get("has_gps", False)):
+        return "Data Check", "No GPS session", "Confirm if off-day, injury, or device issue", combined, practice_level
+    if all(pd.isna(row.get(f"{col}_val")) for col, *_ in FLAG_METRICS):
+        return "Data Check", "Missing GPS data", "Confirm device sync and session upload", combined, practice_level
+
+    if criteria["use_acwr"] and pd.notna(acwr) and acwr >= criteria["review_acwr"]:
+        return "Review", f"High ACWR ({acwr:.2f})", "Check soreness/readiness; consider modified next-day workload", combined, practice_level
+    if criteria["use_combined_load"] and combined == "Major Load Concern":
+        return "Review", "High combined practice + game load", "Check soreness/readiness; avoid additional sprint volume tomorrow", combined, practice_level
+    if criteria["use_combined_load"] and game_class == "High" and criteria["use_acwr"] and pd.notna(acwr) and acwr >= criteria["monitor_acwr"]:
+        return "Review", f"High game load + elevated ACWR ({acwr:.2f})", "Avoid extra sprint volume tomorrow; check next-day readiness", combined, practice_level
+    if has_review:
+        for col, short, unit, flag_enabled, flag_mode in FLAG_METRICS:
+            if flag_enabled and flags.get(col) == "review":
+                z = row.get(f"{col}_z", np.nan)
+                zs = f" (z={z:.1f})" if pd.notna(z) else ""
+                return "Review", f"{short} spike{zs}", "Seek athlete context; consider modified next-day workload", combined, practice_level
+
+    if criteria["use_acwr"] and pd.notna(acwr) and acwr >= criteria["monitor_acwr"]:
+        return "Monitor", f"Elevated ACWR ({acwr:.2f})", "Watch next session; avoid extra volume", combined, practice_level
+    if criteria["use_combined_load"] and combined == "Practice-Driven Spike":
+        return "Monitor", "Practice load spike", "Watch next session; note load context", combined, practice_level
+    if has_monitor:
+        for col, short, unit, flag_enabled, flag_mode in FLAG_METRICS:
+            if flag_enabled and flags.get(col) == "monitor":
+                z = row.get(f"{col}_z", np.nan)
+                zs = f" (z={z:.1f})" if pd.notna(z) else ""
+                return "Monitor", f"{short} elevated{zs}", "Watch next session; note load trend", combined, practice_level
+
+    if criteria["use_exposure_flags"]:
+        ds_sprint = row.get("days_since_sprint")
+        ds_hsr = row.get("days_since_hsr")
+        today_sprint = bool(row.get("today_has_sprint", False))
+        today_hsr = bool(row.get("today_has_hsr", False))
+        r7_sprint = float(row.get("r7_sprint_dist") or 0)
+        r7_hsr = float(row.get("r7_hsr") or 0)
+
+        if pd.notna(ds_sprint) and ds_sprint is not None and ds_sprint > criteria["max_days_without_sprint"]:
+            return "Needs Exposure", f"No sprint exposure ({int(ds_sprint)}d)", "Add controlled sprint exposure if healthy", combined, practice_level
+        if pd.notna(ds_hsr) and ds_hsr is not None and ds_hsr > criteria["max_days_without_hsr"]:
+            return "Needs Exposure", f"No HSR exposure ({int(ds_hsr)}d)", "Add controlled HSR exposure if healthy", combined, practice_level
+        if not today_sprint and r7_sprint < criteria["low_7d_sprint_dist_m"]:
+            return "Needs Exposure", f"Low 7-day sprint dist ({r7_sprint:.0f}m)", "Add controlled sprint exposure if healthy", combined, practice_level
+        if not today_hsr and r7_hsr < criteria["low_7d_hsr_m"]:
+            return "Needs Exposure", f"Low 7-day HSR ({r7_hsr:.0f}m)", "Increase high-speed running volume if healthy", combined, practice_level
+
+    return "Prepared", "Normal workload", "Maintain normal plan", combined, practice_level
+
+
+def build_status_table(bundle, end_date, player_keys, criteria=None) -> pd.DataFrame:
+    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
+    if not player_keys:
+        return pd.DataFrame()
+    end = pd.Timestamp(end_date).normalize()
+    snap = compute_flag_snapshot(bundle, end, player_keys, criteria=criteria)
+    if snap.empty:
+        return pd.DataFrame()
+
+    history = bundle.get("history_calendar", pd.DataFrame())
+    rows = []
+    for _, r in snap.iterrows():
+        status, driver, action, combined, practice_level = classify_status_from_snapshot(r, criteria=criteria)
+        key = r["Player Key"]
+        grp = history[(history["player_key"] == key) & (history["date"] <= end)].sort_values("date") if not history.empty else pd.DataFrame()
+
+        last_game_class = r.get("game_load_class", "—")
+        if pd.isna(r.get("last_game_date")):
+            last_game_label = "—"
+        else:
+            last_game_label = f"{last_game_class} · {int(round(r.get('last_game_runs', 0)))} / {int(round(r.get('last_game_dist_yards', 0)))} yd"
+
+        prev = grp[grp["date"] == end - pd.Timedelta(days=1)] if not grp.empty else pd.DataFrame()
+        if prev.empty or int(prev.iloc[-1].get("practice_observed", 0)) == 0:
+            prev_label = "—"
+        else:
+            pr = prev.iloc[-1]
+            prev_label = f"{int(round(pr.get('n_accelerations', 0)))} acc / {int(round(pr.get('n_sprints', 0)))} spr / {int(round(pr.get('hsr_distance_m', 0)))} m HSR"
+
+        last_sprint = r.get("last_sprint_date")
+        last_sprint_label = "no history" if pd.isna(last_sprint) else pd.Timestamp(last_sprint).strftime("%b %d")
+        acwr = pd.to_numeric(r.get("acwr"), errors="coerce")
+
+        rows.append({
+            "Player Key": key,
+            "Athlete": r.get("Athlete", key),
+            "Team": r.get("Team", ""),
+            "Pos": r.get("Pos", ""),
             "Status": status,
             "Primary Driver": driver,
-            "Combined Load": combined_load_label(today, last_game, criteria=criteria),
+            "Recommended Action": action,
+            "Combined Load": combined,
+            "Practice Level": practice_level,
             "ACWR": round(float(acwr), 2) if pd.notna(acwr) else np.nan,
             "Last Game Load": last_game_label,
             "Practice Load (Prev Day)": prev_label,
-            "Last Sprint": "no history" if last_sprint_days is None else str(last_sprint_days),
+            "Last Sprint": last_sprint_label,
+            "Days Since Sprint": r.get("days_since_sprint"),
+            "Days Since HSR": r.get("days_since_hsr"),
+            "7d Sprint Dist (m)": round(float(r.get("r7_sprint_dist", 0)), 1),
+            "7d HSR (m)": round(float(r.get("r7_hsr", 0)), 1),
+            "Flag Count": int(r.get("flag_count", 0)),
         })
 
     out = pd.DataFrame(rows)
     out["_severity"] = out["Status"].map(STATUS_ORDER).fillna(99)
-    out = out.sort_values(["_severity", "Team", "Athlete"]).drop(columns="_severity")
-    return out.reset_index(drop=True)
-
+    return out.sort_values(["_severity", "Team", "Athlete"]).drop(columns="_severity").reset_index(drop=True)
 
 def build_period_summary(bundle, start_date, end_date, player_keys) -> pd.DataFrame:
     d = bundle["daily"]
@@ -1539,7 +1858,7 @@ TREND_METRICS = [
     ("hsr_distance_m", "HSR", "m", "sum"),
     ("combined_total_distance_m", "Total Distance", "m", "sum"),
     ("duration_min", "Duration", "min", "sum"),
-    ("acwr", "PP_Sprint ACWR", "ratio", "last"),
+    ("acwr", "PP_Sprint EWMA ACWR", "ratio", "last"),
 ]
 
 
@@ -1550,20 +1869,20 @@ def empty_figure(title="No data"):
 
 
 def _trend_rows_for_metric(df: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """Keep only meaningful observations for a trend line.
+    """Keep only true event observations for trends.
 
-    GPS metrics are plotted on actual practice-observed dates only so off-days do
-    not create artificial zero-value sawtooths. PP_Sprint ACWR remains a daily
-    rolling series and is therefore allowed to span the full calendar.
+    GPS metrics use practice-observed dates. EWMA ACWR uses game-observed dates,
+    matching the standalone report's game-appearance (not calendar-day) updates.
     """
     if df is None or df.empty or metric not in df.columns:
         return pd.DataFrame()
     p = df.copy().sort_values("date")
-    if metric != "acwr" and "practice_observed" in p.columns:
+    if metric == "acwr" and "game_observed" in p.columns:
+        p = p[safe_num(p["game_observed"], 0) > 0].copy()
+    elif "practice_observed" in p.columns:
         p = p[safe_num(p["practice_observed"], 0) > 0].copy()
     p[metric] = safe_num(p[metric])
-    p = p[p[metric].notna()].copy()
-    return p
+    return p[p[metric].notna()].copy()
 
 
 def comparison_trend_figure(
@@ -1710,10 +2029,8 @@ def comparison_trend_figure(
 
     if metric == "acwr":
         criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
-        refs = []
-        if criteria["use_low_acwr"]:
-            refs.append((criteria["low_acwr"], C_BLUE))
-        if criteria["use_high_acwr"]:
+        refs = [(criteria["optimal_low_acwr"], C_BLUE)]
+        if criteria["use_acwr"]:
             refs.extend([
                 (criteria["monitor_acwr"], C_AMBER),
                 (criteria["review_acwr"], C_RED),
@@ -1913,23 +2230,20 @@ def make_pdf_bytes(bundle, start_date, end_date, teams, player_keys, criteria=No
         _pdf_text(ax, 0.04, 0.800, f"Athletes: {len(player_keys)}", 9, color=C_MUTED)
         _pdf_text(ax, 0.04, 0.775, "Status snapshot is calculated as of the selected end date.", 8, color=C_MUTED)
         active_rules = []
-        if criteria["use_high_acwr"]:
+        if criteria["use_acwr"]:
+            active_rules.append(f'Game EWMA ACWR Monitor≥{criteria["monitor_acwr"]:.2f} / Review≥{criteria["review_acwr"]:.2f}')
+        if criteria["use_gps_flags"]:
             active_rules.append(
-                f'ACWR Monitor≥{criteria["monitor_acwr"]:.2f} / Review≥{criteria["review_acwr"]:.2f}'
+                f'GPS Team+Position z Monitor≥{criteria["monitor_z"]:.1f} / Review≥{criteria["review_z"]:.1f}; '
+                f'{criteria["rolling_window_days"]}d rolling Sprints/Accels'
             )
-        if criteria["use_hsr_z"] or criteria["use_accel_z"]:
-            labels = []
-            if criteria["use_hsr_z"]:
-                labels.append("HSR")
-            if criteria["use_accel_z"]:
-                labels.append("Accel")
+        if criteria["use_combined_load"]:
+            active_rules.append('Combined practice+game load')
+        if criteria["use_exposure_flags"]:
             active_rules.append(
-                f'{" + ".join(labels)} |practice-peer z| Monitor≥{criteria["monitor_z"]:.1f} / Review≥{criteria["review_z"]:.1f}'
+                f'Sprint gap>{criteria["max_days_without_sprint"]}d / HSR gap>{criteria["max_days_without_hsr"]}d; '
+                f'7d sprint<{criteria["low_7d_sprint_dist_m"]:.0f}m / HSR<{criteria["low_7d_hsr_m"]:.0f}m'
             )
-        if criteria["use_sprint_gap"]:
-            active_rules.append(f'Sprint gap>{criteria["sprint_gap_days"]}d')
-        if criteria["use_low_acwr"]:
-            active_rules.append(f'Low ACWR<{criteria["low_acwr"]:.2f}')
         criteria_text = " · ".join(active_rules) if active_rules else "No optional flag rules enabled"
         _pdf_text(ax, 0.04, 0.750, f"Active criteria: {criteria_text}", 7, color=C_MUTED)
 
@@ -2017,9 +2331,8 @@ def make_pdf_bytes(bundle, start_date, end_date, teams, player_keys, criteria=No
                 y = safe_num(p[metric])
                 ax.plot(p["date"], y, linewidth=1.6, marker="o", markersize=2.8, color=C_NAVY)
                 if metric == "acwr":
-                    if criteria["use_low_acwr"]:
-                        ax.axhline(criteria["low_acwr"], linestyle="--", linewidth=0.8, color=C_BLUE)
-                    if criteria["use_high_acwr"]:
+                    ax.axhline(criteria["optimal_low_acwr"], linestyle="--", linewidth=0.8, color=C_BLUE)
+                    if criteria["use_acwr"]:
                         ax.axhline(criteria["monitor_acwr"], linestyle="--", linewidth=0.8, color=C_AMBER)
                         ax.axhline(criteria["review_acwr"], linestyle="--", linewidth=0.8, color=C_RED)
                 ax.grid(axis="y", alpha=0.18)
@@ -2178,21 +2491,10 @@ def _perform_api_sync(start_value, end_value):
 
 
 def _reset_flag_criteria():
-    st.session_state["flag_acwr_thresholds"] = (
-        DEFAULT_FLAG_CRITERIA["monitor_acwr"],
-        DEFAULT_FLAG_CRITERIA["review_acwr"],
-    )
-    st.session_state["flag_low_acwr"] = DEFAULT_FLAG_CRITERIA["low_acwr"]
-    st.session_state["flag_z_thresholds"] = (
-        DEFAULT_FLAG_CRITERIA["monitor_z"],
-        DEFAULT_FLAG_CRITERIA["review_z"],
-    )
-    st.session_state["flag_sprint_gap"] = DEFAULT_FLAG_CRITERIA["sprint_gap_days"]
-    st.session_state["flag_use_high_acwr"] = DEFAULT_FLAG_CRITERIA["use_high_acwr"]
-    st.session_state["flag_use_hsr_z"] = DEFAULT_FLAG_CRITERIA["use_hsr_z"]
-    st.session_state["flag_use_accel_z"] = DEFAULT_FLAG_CRITERIA["use_accel_z"]
-    st.session_state["flag_use_sprint_gap"] = DEFAULT_FLAG_CRITERIA["use_sprint_gap"]
-    st.session_state["flag_use_low_acwr"] = DEFAULT_FLAG_CRITERIA["use_low_acwr"]
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("flag_"):
+            del st.session_state[key]
+
 
 
 # Manual refresh invalidates the 5-minute Streamlit cache.
@@ -2316,112 +2618,126 @@ with st.sidebar:
 
     with st.expander("Flagging Criteria", expanded=False):
         st.caption(
-            "Adjust these values to change Review, Monitor, and Needs Exposure flags. "
-            "Changes apply immediately to the dashboard and generated PDFs."
+            "Defaults match the standalone GPS workload report. Changes apply immediately "
+            "to the dashboard and generated PDFs."
         )
 
-        use_high_acwr = st.checkbox(
-            "Use high ACWR flags",
-            value=DEFAULT_FLAG_CRITERIA["use_high_acwr"],
-            key="flag_use_high_acwr",
+        use_acwr = st.checkbox(
+            "Use PP_Sprint EWMA ACWR flags",
+            value=DEFAULT_FLAG_CRITERIA["use_acwr"],
+            key="flag_use_acwr",
         )
         acwr_monitor, acwr_review = st.slider(
             "ACWR thresholds — Monitor / Review",
             min_value=0.80,
             max_value=2.50,
-            value=(
-                DEFAULT_FLAG_CRITERIA["monitor_acwr"],
-                DEFAULT_FLAG_CRITERIA["review_acwr"],
-            ),
+            value=(DEFAULT_FLAG_CRITERIA["monitor_acwr"], DEFAULT_FLAG_CRITERIA["review_acwr"]),
             step=0.05,
             key="flag_acwr_thresholds",
-            disabled=not use_high_acwr,
-            help="Values at or above the Review threshold are Review; values between Monitor and Review are Monitor.",
+            disabled=not use_acwr,
         )
-
-        use_low_acwr = st.checkbox(
-            "Use low ACWR as Needs Exposure",
-            value=DEFAULT_FLAG_CRITERIA["use_low_acwr"],
-            key="flag_use_low_acwr",
-        )
-        low_acwr = st.slider(
-            "Needs Exposure if ACWR is below",
-            min_value=0.00,
-            max_value=1.20,
-            value=DEFAULT_FLAG_CRITERIA["low_acwr"],
-            step=0.05,
-            key="flag_low_acwr",
-            disabled=not use_low_acwr,
-        )
-
         st.caption(
-            "ACWR uses PP_Sprint game total distance only: 7-day load divided by the normalized 28-day game load. "
-            "Practice GPS load is not included in ACWR."
+            "ACWR is an EWMA 7:28 ratio from PP_Sprint max-effort game distance. "
+            "It advances on game appearances only; practice GPS is not part of ACWR."
         )
 
-        st.markdown("**Same-practice GPS outliers**")
-        st.caption(
-            "HSR and accelerations are leave-one-out z-scores versus the other position players "
-            "in that team's practice on the same date. Both unusually high and unusually low values can flag."
-        )
-        use_hsr_z = st.checkbox(
-            "Use HSR practice-peer z-score",
-            value=DEFAULT_FLAG_CRITERIA["use_hsr_z"],
-            key="flag_use_hsr_z",
-        )
-        use_accel_z = st.checkbox(
-            "Use acceleration practice-peer z-score",
-            value=DEFAULT_FLAG_CRITERIA["use_accel_z"],
-            key="flag_use_accel_z",
+        use_gps_flags = st.checkbox(
+            "Use GPS workload outlier flags",
+            value=DEFAULT_FLAG_CRITERIA["use_gps_flags"],
+            key="flag_use_gps_flags",
         )
         z_monitor, z_review = st.slider(
-            "Absolute peer z-score thresholds — Monitor / Review",
+            "GPS z-score thresholds — Monitor / Review",
             min_value=0.50,
             max_value=4.00,
-            value=(
-                DEFAULT_FLAG_CRITERIA["monitor_z"],
-                DEFAULT_FLAG_CRITERIA["review_z"],
-            ),
+            value=(DEFAULT_FLAG_CRITERIA["monitor_z"], DEFAULT_FLAG_CRITERIA["review_z"]),
             step=0.10,
             key="flag_z_thresholds",
-            disabled=not (use_hsr_z or use_accel_z),
+            disabled=not use_gps_flags,
+            help="Sprint Distance, HSR, and Total Distance use same-day Team + Position z-scores. Sprints and Accelerations use rolling baselines when available.",
+        )
+        rolling_days = st.slider(
+            "Rolling baseline window (days)", 7, 28,
+            value=DEFAULT_FLAG_CRITERIA["rolling_window_days"], step=1,
+            key="flag_rolling_days", disabled=not use_gps_flags,
+        )
+        rolling_min_sessions = st.slider(
+            "Minimum prior sessions for rolling Sprints/Accels", 2, 10,
+            value=DEFAULT_FLAG_CRITERIA["rolling_min_sessions"], step=1,
+            key="flag_rolling_min_sessions", disabled=not use_gps_flags,
+        )
+        sprint_delta = st.number_input(
+            "Minimum Sprint-count increase to flag", min_value=0.0, max_value=20.0,
+            value=float(DEFAULT_FLAG_CRITERIA["rolling_min_delta_sprints"]), step=1.0,
+            key="flag_sprint_delta", disabled=not use_gps_flags,
+        )
+        accel_delta = st.number_input(
+            "Minimum Acceleration increase to flag", min_value=0.0, max_value=30.0,
+            value=float(DEFAULT_FLAG_CRITERIA["rolling_min_delta_accels"]), step=1.0,
+            key="flag_accel_delta", disabled=not use_gps_flags,
+        )
+        st.caption(
+            "Only positive workload spikes flag, matching gps_flags.py. The comparison group is Team + Position; "
+            "at least 4 same-day athletes are required for same-day z-scores."
         )
 
-        use_sprint_gap = st.checkbox(
-            "Use sprint-exposure gap",
-            value=DEFAULT_FLAG_CRITERIA["use_sprint_gap"],
-            key="flag_use_sprint_gap",
-        )
-        sprint_gap_days = st.slider(
-            "Needs Exposure after more than this many days without sprint exposure",
-            min_value=1,
-            max_value=21,
-            value=DEFAULT_FLAG_CRITERIA["sprint_gap_days"],
-            step=1,
-            key="flag_sprint_gap",
-            disabled=not use_sprint_gap,
+        use_combined_load = st.checkbox(
+            "Use combined practice + game load logic",
+            value=DEFAULT_FLAG_CRITERIA["use_combined_load"],
+            key="flag_use_combined_load",
         )
 
-        st.caption("Data Check still takes priority when there is no GPS/game activity on the selected end date.")
-        st.button(
-            "Reset flag criteria",
-            on_click=_reset_flag_criteria,
-            use_container_width=True,
+        use_exposure_flags = st.checkbox(
+            "Use sprint / HSR exposure flags",
+            value=DEFAULT_FLAG_CRITERIA["use_exposure_flags"],
+            key="flag_use_exposure_flags",
         )
+        sprint_gap = st.slider(
+            "Sprint gap — Needs Exposure after more than (days)", 1, 14,
+            value=DEFAULT_FLAG_CRITERIA["max_days_without_sprint"], step=1,
+            key="flag_sprint_gap", disabled=not use_exposure_flags,
+        )
+        hsr_gap = st.slider(
+            "HSR gap — Needs Exposure after more than (days)", 1, 14,
+            value=DEFAULT_FLAG_CRITERIA["max_days_without_hsr"], step=1,
+            key="flag_hsr_gap", disabled=not use_exposure_flags,
+        )
+        low7_sprint = st.number_input(
+            "Minimum 7-day sprint distance (m)", min_value=0.0, max_value=300.0,
+            value=float(DEFAULT_FLAG_CRITERIA["low_7d_sprint_dist_m"]), step=5.0,
+            key="flag_low7_sprint", disabled=not use_exposure_flags,
+        )
+        low7_hsr = st.number_input(
+            "Minimum 7-day HSR (m)", min_value=0.0, max_value=500.0,
+            value=float(DEFAULT_FLAG_CRITERIA["low_7d_hsr_m"]), step=5.0,
+            key="flag_low7_hsr", disabled=not use_exposure_flags,
+        )
+
+        st.caption("Data Check takes priority when there is no GPS session on the selected end date.")
+        st.button("Reset flag criteria", on_click=_reset_flag_criteria, use_container_width=True)
 
     flag_criteria = {
+        **DEFAULT_FLAG_CRITERIA,
         "monitor_acwr": float(acwr_monitor),
         "review_acwr": float(acwr_review),
-        "low_acwr": float(low_acwr),
         "monitor_z": float(z_monitor),
         "review_z": float(z_review),
-        "sprint_gap_days": int(sprint_gap_days),
-        "use_high_acwr": bool(use_high_acwr),
-        "use_hsr_z": bool(use_hsr_z),
-        "use_accel_z": bool(use_accel_z),
-        "use_sprint_gap": bool(use_sprint_gap),
-        "use_low_acwr": bool(use_low_acwr),
+        "rolling_monitor_z": float(z_monitor),
+        "rolling_review_z": float(z_review),
+        "rolling_window_days": int(rolling_days),
+        "rolling_min_sessions": int(rolling_min_sessions),
+        "rolling_min_delta_sprints": float(sprint_delta),
+        "rolling_min_delta_accels": float(accel_delta),
+        "max_days_without_sprint": int(sprint_gap),
+        "max_days_without_hsr": int(hsr_gap),
+        "low_7d_sprint_dist_m": float(low7_sprint),
+        "low_7d_hsr_m": float(low7_hsr),
+        "use_acwr": bool(use_acwr),
+        "use_gps_flags": bool(use_gps_flags),
+        "use_combined_load": bool(use_combined_load),
+        "use_exposure_flags": bool(use_exposure_flags),
     }
+
 
     st.divider()
     st.caption(load_message)
@@ -2747,24 +3063,22 @@ with summary_tab:
 
 st.divider()
 active_criteria_parts = []
-if flag_criteria["use_high_acwr"]:
+if flag_criteria["use_acwr"]:
     active_criteria_parts.append(
-        f'ACWR Monitor ≥ {flag_criteria["monitor_acwr"]:.2f}, Review ≥ {flag_criteria["review_acwr"]:.2f}'
+        f'Game EWMA ACWR Monitor ≥ {flag_criteria["monitor_acwr"]:.2f}, Review ≥ {flag_criteria["review_acwr"]:.2f}'
     )
-if flag_criteria["use_hsr_z"] or flag_criteria["use_accel_z"]:
-    active_metrics = []
-    if flag_criteria["use_hsr_z"]:
-        active_metrics.append("HSR")
-    if flag_criteria["use_accel_z"]:
-        active_metrics.append("acceleration")
+if flag_criteria["use_gps_flags"]:
     active_criteria_parts.append(
-        f'{" + ".join(active_metrics)} |practice-peer z| Monitor ≥ {flag_criteria["monitor_z"]:.1f}, '
-        f'Review ≥ {flag_criteria["review_z"]:.1f}'
+        f'GPS Team + Position z Monitor ≥ {flag_criteria["monitor_z"]:.1f}, Review ≥ {flag_criteria["review_z"]:.1f}; '
+        f'{flag_criteria["rolling_window_days"]}d rolling Sprints/Accels'
     )
-if flag_criteria["use_sprint_gap"]:
-    active_criteria_parts.append(f'Sprint gap > {flag_criteria["sprint_gap_days"]} days')
-if flag_criteria["use_low_acwr"]:
-    active_criteria_parts.append(f'Low ACWR < {flag_criteria["low_acwr"]:.2f}')
+if flag_criteria["use_combined_load"]:
+    active_criteria_parts.append("combined practice + game load")
+if flag_criteria["use_exposure_flags"]:
+    active_criteria_parts.append(
+        f'sprint gap > {flag_criteria["max_days_without_sprint"]}d, HSR gap > {flag_criteria["max_days_without_hsr"]}d, '
+        f'7d sprint < {flag_criteria["low_7d_sprint_dist_m"]:.0f}m, 7d HSR < {flag_criteria["low_7d_hsr_m"]:.0f}m'
+    )
 
 st.caption(
     "Active flagging criteria: "
