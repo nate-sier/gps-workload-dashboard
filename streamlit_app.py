@@ -2306,31 +2306,32 @@ def team_context_trend_figure(
 
     unit_labels = {"m": "Meters", "m/s": "m/s", "#": "Count", "min": "Minutes", "ratio": "ACWR"}
     y_title = unit_labels.get(unit, unit)
-    fig.update_layout(
+    context_layout = {
         **PLOT_LAYOUT,
-        height=455,
-        margin=dict(l=62, r=24, t=34, b=50),
-        title=dict(text=""),
-        hovermode="closest",
-        legend=dict(
+        "height": 455,
+        "margin": dict(l=62, r=24, t=34, b=50),
+        "title": dict(text=""),
+        "hovermode": "closest",
+        "legend": dict(
             orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
             bgcolor="rgba(0,0,0,0)", borderwidth=0,
             font=dict(size=10, color=C_MUTED),
         ),
-        xaxis=dict(
+        "xaxis": dict(
             showgrid=False, zeroline=False, showline=True,
             linecolor="#D7DEE8", linewidth=1,
             tickformat="%b %d", tickfont=dict(size=11, color=C_MUTED),
             title=dict(text=""), fixedrange=False,
         ),
-        yaxis=dict(
+        "yaxis": dict(
             showgrid=True, gridcolor="#E8EDF3", gridwidth=1,
             zeroline=False, showline=False,
             tickfont=dict(size=11, color=C_MUTED),
             title=dict(text=y_title, font=dict(size=11, color=C_MUTED), standoff=10),
             fixedrange=False,
         ),
-    )
+    }
+    fig.update_layout(**context_layout)
     return fig
 
 
