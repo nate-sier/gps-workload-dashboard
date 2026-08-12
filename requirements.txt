@@ -7,4 +7,4 @@ google-auth
 requests
 urllib3
 openpyxl
-playwright
+playwright>=1.45
