@@ -2174,6 +2174,221 @@ def comparison_trend_figure(
     return fig
 
 
+
+def team_context_trend_figure(
+    bundle,
+    start_date,
+    end_date,
+    reference_team,
+    metric,
+    title,
+    unit,
+    focus_player_key=None,
+    criteria=None,
+    show_middle_50=True,
+):
+    """Clean trend view: one focus athlete against the team's daily median/IQR.
+
+    The prior dashboard put every athlete on one chart by default. This view uses
+    the team as context instead: a restrained middle-50% band + median, with at
+    most one athlete emphasized. Multi-athlete overlays remain available as an
+    explicit comparison view in the UI.
+    """
+    history = bundle.get("history_calendar", pd.DataFrame())
+    if history is None or history.empty or not reference_team:
+        return empty_figure(title)
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    team_keys = eligible_player_keys(bundle, start, end, [reference_team], selected_keys=None)
+    if not team_keys:
+        return empty_figure(title)
+
+    team_history = history[
+        history["date"].between(start, end)
+        & history["player_key"].isin(team_keys)
+        & history["team"].eq(reference_team)
+    ].copy()
+    team_history = _trend_rows_for_metric(team_history, metric)
+    if team_history.empty:
+        return empty_figure(title)
+
+    grouped = team_history.groupby("date")[metric]
+    team_daily = pd.DataFrame({
+        "date": grouped.median().index,
+        "median": grouped.median().values,
+        "q25": grouped.quantile(0.25).values,
+        "q75": grouped.quantile(0.75).values,
+        "n": grouped.count().values,
+    }).sort_values("date")
+
+    fig = go.Figure()
+    hover_unit = "" if unit == "ratio" else f" {unit}"
+
+    # Middle 50% is intentionally subtle: it gives context without producing a
+    # spaghetti chart of every player on the roster.
+    if show_middle_50 and not team_daily.empty:
+        fig.add_trace(go.Scatter(
+            x=team_daily["date"],
+            y=team_daily["q25"],
+            mode="lines",
+            line=dict(width=0, color="rgba(17,34,90,0)"),
+            hoverinfo="skip",
+            showlegend=False,
+            name="25th percentile",
+        ))
+        fig.add_trace(go.Scatter(
+            x=team_daily["date"],
+            y=team_daily["q75"],
+            mode="lines",
+            line=dict(width=0, color="rgba(17,34,90,0)"),
+            fill="tonexty",
+            fillcolor="rgba(17,34,90,0.10)",
+            name="Team middle 50%",
+            customdata=team_daily[["q25"]].to_numpy(),
+            hovertemplate=(
+                f"<b>{reference_team} middle 50%</b><br>"
+                f"%{{x|%b %d, %Y}}<br>Range: %{{customdata[0]:.1f}}–%{{y:.1f}}{hover_unit}<extra></extra>"
+            ),
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=team_daily["date"],
+        y=team_daily["median"],
+        mode="lines",
+        name=f"{reference_team} median",
+        line=dict(color=C_NAVY, width=2.4, dash="dash"),
+        opacity=0.9,
+        connectgaps=False,
+        hovertemplate=(
+            f"<b>{reference_team} median</b><br>"
+            f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.1f}}{hover_unit}<extra></extra>"
+        ),
+    ))
+
+    if focus_player_key:
+        display = player_display_map(bundle)
+        focus = history[
+            history["date"].between(start, end)
+            & history["player_key"].eq(focus_player_key)
+        ].copy()
+        focus = _trend_rows_for_metric(focus, metric)
+        if not focus.empty:
+            fig.add_trace(go.Scatter(
+                x=focus["date"],
+                y=focus[metric],
+                mode="lines+markers",
+                name=display.get(focus_player_key, focus_player_key),
+                line=dict(color=C_RED, width=3.1),
+                marker=dict(size=5, color=C_RED, line=dict(width=1, color="white")),
+                connectgaps=False,
+                hovertemplate=(
+                    f"<b>{display.get(focus_player_key, focus_player_key)}</b><br>"
+                    f"%{{x|%b %d, %Y}}<br>{title}: %{{y:.1f}}{hover_unit}<extra></extra>"
+                ),
+            ))
+
+    if metric == "acwr":
+        criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
+        fig.add_hline(
+            y=criteria["optimal_low_acwr"], line_dash="dot", line_color=C_BLUE,
+            line_width=1.0, opacity=0.45,
+        )
+        if criteria["use_acwr"]:
+            fig.add_hline(
+                y=criteria["monitor_acwr"], line_dash="dot", line_color=C_AMBER,
+                line_width=1.0, opacity=0.5,
+            )
+            fig.add_hline(
+                y=criteria["review_acwr"], line_dash="dot", line_color=C_RED,
+                line_width=1.0, opacity=0.5,
+            )
+
+    unit_labels = {"m": "Meters", "m/s": "m/s", "#": "Count", "min": "Minutes", "ratio": "ACWR"}
+    y_title = unit_labels.get(unit, unit)
+    fig.update_layout(
+        **PLOT_LAYOUT,
+        height=455,
+        margin=dict(l=62, r=24, t=34, b=50),
+        title=dict(text=""),
+        hovermode="closest",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+            bgcolor="rgba(0,0,0,0)", borderwidth=0,
+            font=dict(size=10, color=C_MUTED),
+        ),
+        xaxis=dict(
+            showgrid=False, zeroline=False, showline=True,
+            linecolor="#D7DEE8", linewidth=1,
+            tickformat="%b %d", tickfont=dict(size=11, color=C_MUTED),
+            title=dict(text=""), fixedrange=False,
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor="#E8EDF3", gridwidth=1,
+            zeroline=False, showline=False,
+            tickfont=dict(size=11, color=C_MUTED),
+            title=dict(text=y_title, font=dict(size=11, color=C_MUTED), standoff=10),
+            fixedrange=False,
+        ),
+    )
+    return fig
+
+
+def latest_focus_metric_context(bundle, start_date, end_date, reference_team, focus_player_key, metric):
+    """Return latest athlete value plus same-day team context for UI summary cards."""
+    history = bundle.get("history_calendar", pd.DataFrame())
+    if history is None or history.empty or not focus_player_key:
+        return None
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    focus = history[
+        history["date"].between(start, end)
+        & history["player_key"].eq(focus_player_key)
+    ].copy()
+    focus = _trend_rows_for_metric(focus, metric)
+    if focus.empty:
+        return None
+    focus = focus.sort_values("date")
+    latest = focus.iloc[-1]
+    latest_date = pd.Timestamp(latest["date"]).normalize()
+    value = pd.to_numeric(pd.Series([latest[metric]]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return None
+
+    team_keys = eligible_player_keys(bundle, start, end, [reference_team], selected_keys=None)
+    same_day = history[
+        history["date"].eq(latest_date)
+        & history["player_key"].isin(team_keys)
+        & history["team"].eq(reference_team)
+    ].copy()
+    same_day = _trend_rows_for_metric(same_day, metric)
+    vals = pd.to_numeric(same_day.get(metric, pd.Series(dtype=float)), errors="coerce").dropna()
+    median = float(vals.median()) if not vals.empty else np.nan
+    percentile = float((vals <= float(value)).mean() * 100.0) if len(vals) >= 2 else np.nan
+    return {
+        "date": latest_date,
+        "value": float(value),
+        "team_median": median,
+        "delta_vs_median": float(value - median) if pd.notna(median) else np.nan,
+        "percentile": percentile,
+        "team_n": int(len(vals)),
+    }
+
+def format_trend_value(value, unit, signed=False):
+    if pd.isna(value):
+        return "—"
+    sign = "+" if signed and float(value) > 0 else ""
+    if unit == "#":
+        return f"{sign}{float(value):.0f}"
+    if unit == "ratio":
+        return f"{sign}{float(value):.2f}"
+    if unit == "m/s":
+        return f"{sign}{float(value):.2f} m/s"
+    suffix = f" {unit}" if unit else ""
+    return f"{sign}{float(value):.1f}{suffix}"
+
+
 def team_period_figure(bundle, start_date, end_date, player_keys):
     h = selected_history(bundle, start_date, end_date, player_keys)
     if h.empty:
@@ -2515,6 +2730,67 @@ st.markdown(
           font-size: 0.76rem;
           font-weight: 700;
           color: white;
+      }}
+      .status-grid {{
+          display: grid;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          gap: 0.75rem;
+          margin: 0.55rem 0 1.15rem 0;
+      }}
+      .status-card {{
+          background: #FFFFFF;
+          border: 1px solid {C_BORDER};
+          border-radius: 10px;
+          padding: 0.85rem 0.95rem 0.78rem 0.95rem;
+          min-height: 96px;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.035);
+      }}
+      .status-card-label {{
+          color: {C_MUTED};
+          font-size: 0.75rem;
+          font-weight: 700;
+          letter-spacing: 0.035em;
+          text-transform: uppercase;
+      }}
+      .status-card-value {{
+          font-size: 1.75rem;
+          font-weight: 760;
+          line-height: 1.05;
+          margin-top: 0.28rem;
+      }}
+      .status-card-sub {{
+          color: {C_MUTED};
+          font-size: 0.74rem;
+          margin-top: 0.3rem;
+      }}
+      .section-kicker {{
+          color: {C_MUTED};
+          font-size: 0.74rem;
+          font-weight: 700;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          margin-top: 0.2rem;
+          margin-bottom: 0.05rem;
+      }}
+      .focus-panel {{
+          background: #FFFFFF;
+          border: 1px solid {C_BORDER};
+          border-radius: 10px;
+          padding: 0.9rem 1rem;
+          margin: 0.35rem 0 0.8rem 0;
+      }}
+      .focus-name {{
+          color: {C_TEXT};
+          font-size: 1.12rem;
+          font-weight: 720;
+          margin-bottom: 0.18rem;
+      }}
+      .focus-meta {{
+          color: {C_MUTED};
+          font-size: 0.8rem;
+      }}
+      @media (max-width: 900px) {{
+          .status-grid {{grid-template-columns: repeat(2, minmax(0, 1fr));}}
       }}
       hr {{border-color: {C_BORDER};}}
     </style>
@@ -2987,7 +3263,6 @@ if artifact and artifact.get("date") == str(end_date) and artifact.get("zip_byte
     if artifact.get("errors"):
         st.warning("Some team reports failed: " + " | ".join(artifact["errors"]))
 
-st.caption("REPORT UI BUILD: 2026-08-12 17:03 ET · selector directly under Build Team Reports")
 st.caption(
     "Reports use the supplied standalone GPS reporting structure and the current Python Reports → Master Roster. "
     "The selected end date is used as the report date."
@@ -2998,232 +3273,294 @@ if not keys:
     st.stop()
 
 counts = status["Status"].value_counts() if not status.empty else pd.Series(dtype=int)
-cols = st.columns(5)
-for col, name, subtitle in zip(
-    cols,
-    ["Review", "Monitor", "Needs Exposure", "Prepared", "Data Check"],
-    ["Prioritize", "Watch closely", "Rolling gap", "Normal workload", "Missing end-date data"],
-):
-    with col:
-        st.metric(name, int(counts.get(name, 0)), help=subtitle)
+
+# A dashboard should answer "who needs attention?" before it asks the user to
+# interpret a dense table or a spaghetti chart.
+status_specs = [
+    ("Review", "Prioritize today", C_RED),
+    ("Monitor", "Watch closely", C_AMBER),
+    ("Needs Exposure", "Rolling exposure gap", C_BLUE),
+    ("Prepared", "Normal workload", C_GREEN),
+    ("Data Check", "Missing / no session", C_GRAY),
+]
+status_cards = []
+for name, subtitle, color in status_specs:
+    status_cards.append(
+        f'<div class="status-card" style="border-top:3px solid {color};">'
+        f'<div class="status-card-label">{name}</div>'
+        f'<div class="status-card-value" style="color:{color};">{int(counts.get(name, 0))}</div>'
+        f'<div class="status-card-sub">{subtitle}</div>'
+        '</div>'
+    )
+st.markdown('<div class="status-grid">' + ''.join(status_cards) + '</div>', unsafe_allow_html=True)
 
 overview_tab, player_tab, summary_tab = st.tabs(
-    ["Overview", "Player Trends", "Period Summary"]
+    ["Overview", "Player Detail", "Period Summary"]
 )
 
+metric_lookup = {metric: (title, unit, agg) for metric, title, unit, agg in TREND_METRICS}
+metric_keys = list(metric_lookup)
+
 with overview_tab:
-    st.subheader("Athlete Snapshot")
+    st.markdown('<div class="section-kicker">Decision view</div>', unsafe_allow_html=True)
+    st.subheader("Athletes Requiring Attention")
+
     if status.empty:
         st.info("No status rows for this selection.")
     else:
-        show_cols = [
-            "Athlete", "Team", "Pos", "Status", "Primary Driver", "Combined Load",
-            "ACWR", "Last Game Load", "Practice Load (Prev Day)", "Last Sprint",
+        attention = status[status["Status"].isin(["Review", "Monitor", "Needs Exposure"])].copy()
+        attention_cols = [
+            "Athlete", "Team", "Pos", "Status", "Primary Driver", "ACWR", "Last Sprint"
         ]
-        show = status[show_cols].copy()
-        show["ACWR"] = pd.to_numeric(show["ACWR"], errors="coerce").round(2)
-        st.dataframe(show, use_container_width=True, hide_index=True, height=520)
+        if attention.empty:
+            st.success("No Review, Monitor, or Needs Exposure athletes in the current selection.")
+        else:
+            attention_show = attention[attention_cols].copy()
+            attention_show["ACWR"] = pd.to_numeric(attention_show["ACWR"], errors="coerce").round(2)
+            st.dataframe(
+                attention_show,
+                use_container_width=True,
+                hide_index=True,
+                height=min(430, 42 + 36 * len(attention_show)),
+            )
 
-    st.subheader("Team Workload Trend")
-    st.plotly_chart(
-        team_period_figure(bundle, start_date, end_date, keys),
-        use_container_width=True,
-        config={"displaylogo": False},
+        with st.expander(f"Full athlete snapshot ({len(status)} athletes)", expanded=False):
+            show_cols = [
+                "Athlete", "Team", "Pos", "Status", "Primary Driver", "Combined Load",
+                "ACWR", "Last Game Load", "Practice Load (Prev Day)", "Last Sprint",
+            ]
+            show = status[show_cols].copy()
+            show["ACWR"] = pd.to_numeric(show["ACWR"], errors="coerce").round(2)
+            st.dataframe(show, use_container_width=True, hide_index=True, height=520)
+
+    st.divider()
+    st.markdown('<div class="section-kicker">Team context</div>', unsafe_allow_html=True)
+    st.subheader("Team Workload Distribution")
+    st.caption(
+        "The line is the team median. The shaded band is the middle 50% of athletes, "
+        "so you can see the normal daily range without drawing every player on top of each other."
     )
+
+    overview_team_options = [
+        team for team in ordered_teams(teams)
+        if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
+    ]
+    if not overview_team_options:
+        overview_team_options = [
+            team for team in TEAM_ORDER
+            if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
+        ]
+
+    if overview_team_options:
+        c_team, c_metric = st.columns([1.0, 1.25])
+        with c_team:
+            overview_team = st.selectbox(
+                "Team",
+                options=overview_team_options,
+                index=0,
+                key="overview_context_team_v5",
+            )
+        with c_metric:
+            overview_metric = st.selectbox(
+                "Metric",
+                options=metric_keys,
+                index=metric_keys.index("combined_total_distance_m")
+                if "combined_total_distance_m" in metric_keys else 0,
+                format_func=lambda m: metric_lookup[m][0],
+                key="overview_context_metric_v5",
+            )
+        overview_title, overview_unit, _ = metric_lookup[overview_metric]
+        st.plotly_chart(
+            team_context_trend_figure(
+                bundle,
+                start_date,
+                end_date,
+                overview_team,
+                overview_metric,
+                overview_title,
+                overview_unit,
+                focus_player_key=None,
+                criteria=flag_criteria,
+                show_middle_50=True,
+            ),
+            use_container_width=True,
+            config={"displaylogo": False, "displayModeBar": False, "responsive": True},
+        )
+    else:
+        st.info("No team trend data are available for the selected period.")
 
 with player_tab:
-    st.subheader("Player Trends")
+    st.markdown('<div class="section-kicker">Individual interpretation</div>', unsafe_allow_html=True)
+    st.subheader("Player vs Team Context")
     st.caption(
-        "Select team(s) to load their players, then remove anyone with bad data or add players "
-        "from another team. Individual player lines and average membership are controlled separately."
+        "Pick one athlete to emphasize. The team stays in the background as a median + middle-50% range, "
+        "instead of putting the entire roster on the same chart."
     )
 
-    # Player Trends is intentionally independent of the sidebar team/player filters.
     trend_team_options = [
         team for team in TEAM_ORDER
         if eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
     ]
 
-    if hasattr(st, "pills"):
-        trend_selected_teams = st.pills(
-            "Team quick-select",
-            options=trend_team_options,
-            selection_mode="multi",
-            default=[],
-            key="trend_team_pills_clean_v4",
-            help="Select one or more teams. Their eligible position players are loaded into the player selector below.",
-        ) or []
+    if not trend_team_options:
+        st.info("No player trend data are available for this period.")
     else:
-        trend_selected_teams = st.multiselect(
-            "Team quick-select",
-            options=trend_team_options,
-            default=[],
-            key="trend_team_multiselect_clean_v4",
-            placeholder="Select team(s)",
-        )
-
-    trend_scope_keys = eligible_player_keys(
-        bundle, start_date, end_date, TEAM_ORDER, selected_keys=None
-    )
-    all_player_options = sorted(trend_scope_keys, key=lambda k: display_map.get(k, k))
-
-    seeded_players = []
-    for team in trend_selected_teams:
-        seeded_players.extend(
-            eligible_player_keys(bundle, start_date, end_date, [team], selected_keys=None)
-        )
-    seeded_players = sorted(set(seeded_players), key=lambda k: display_map.get(k, k))
-
-    player_seed_key = "_".join(
-        re.sub(r"[^a-z0-9]+", "_", str(t).casefold()).strip("_")
-        for t in trend_selected_teams
-    ) or "custom"
-
-    roster = bundle.get("roster", pd.DataFrame())
-    roster_team_map = (
-        roster.set_index("player_key")["roster_team"].to_dict()
-        if roster is not None and not roster.empty and "roster_team" in roster.columns
-        else {}
-    )
-
-    trend_players = st.multiselect(
-        "Players shown",
-        options=all_player_options,
-        default=seeded_players,
-        format_func=lambda k: (
-            f"{display_map.get(k, k)} · {roster_team_map.get(k, '')}"
-            if roster_team_map.get(k, "") else display_map.get(k, k)
-        ),
-        key=f"trend_players_clean_{player_seed_key}_v4",
-        help="Remove players from a selected team or add players from any other approved team.",
-        placeholder="Search position players",
-    )
-
-    metric_lookup = {metric: (title, unit, agg) for metric, title, unit, agg in TREND_METRICS}
-    metric_keys = list(metric_lookup)
-
-    c_metric, c_average, c_legend = st.columns([1.35, 1.35, 1.0])
-    with c_metric:
-        metric = st.selectbox(
-            "Metric",
-            options=metric_keys,
-            index=metric_keys.index("combined_total_distance_m")
-            if "combined_total_distance_m" in metric_keys else 0,
-            format_func=lambda m: metric_lookup[m][0],
-            key="trend_metric_clean_v4",
-        )
-    with c_average:
-        avg_default = "Team average" if trend_selected_teams else "Selected player average"
-        average_mode = st.selectbox(
-            "Average line",
-            options=["Team average", "Selected player average", "Both", "None"],
-            index=["Team average", "Selected player average", "Both", "None"].index(avg_default),
-            key=f"trend_average_mode_clean_{player_seed_key}_v4",
-        )
-    with c_legend:
-        legend_mode_label = st.selectbox(
-            "Legend",
-            options=["Averages only", "All players", "Off"],
-            index=0,
-            key="trend_legend_clean_v4",
-            help="Averages only is the clean default. Hover any individual line to identify the player.",
-        )
-
-    trend_title, trend_unit, _ = metric_lookup[metric]
-    legend_mode = {
-        "Averages only": "averages",
-        "All players": "all",
-        "Off": "off",
-    }[legend_mode_label]
-
-    show_team_average = average_mode in {"Team average", "Both"} and bool(trend_selected_teams)
-    show_selected_average = average_mode in {"Selected player average", "Both"}
-    trend_teams = list(trend_selected_teams)
-    restrict_player_teams = None
-
-    team_average_exclude = []
-    if show_team_average and seeded_players:
-        with st.expander("Team average exclusions", expanded=False):
-            st.caption(
-                "Use this only when a player's GPS is bad. They can stay visible on the chart while being removed from the team-average calculation."
+        preferred_team = next((t for t in teams if t in trend_team_options), trend_team_options[0])
+        c_team, c_player, c_metric = st.columns([1.0, 1.45, 1.15])
+        with c_team:
+            trend_reference_team = st.selectbox(
+                "Reference team",
+                options=trend_team_options,
+                index=trend_team_options.index(preferred_team),
+                key="trend_reference_team_v5",
             )
-            team_average_exclude = st.multiselect(
-                "Exclude from team average",
-                options=seeded_players,
-                default=[],
+
+        team_player_options = eligible_player_keys(
+            bundle, start_date, end_date, [trend_reference_team], selected_keys=None
+        )
+        team_player_options = sorted(team_player_options, key=lambda k: display_map.get(k, k))
+
+        with c_player:
+            focus_player = st.selectbox(
+                "Focus athlete",
+                options=team_player_options,
+                index=0,
+                format_func=lambda k: display_map.get(k, k),
+                key=f"trend_focus_player_{re.sub(r'[^a-z0-9]+', '_', trend_reference_team.casefold()).strip('_')}_v5",
+            )
+        with c_metric:
+            metric = st.selectbox(
+                "Metric",
+                options=metric_keys,
+                index=metric_keys.index("combined_total_distance_m")
+                if "combined_total_distance_m" in metric_keys else 0,
+                format_func=lambda m: metric_lookup[m][0],
+                key="trend_focus_metric_v5",
+            )
+
+        trend_title, trend_unit, _ = metric_lookup[metric]
+        focus_context = latest_focus_metric_context(
+            bundle, start_date, end_date, trend_reference_team, focus_player, metric
+        )
+        focus_status = build_status_table(bundle, end_date, [focus_player], criteria=flag_criteria)
+        focus_status_text = "—"
+        focus_driver = "No end-date status"
+        if not focus_status.empty:
+            focus_status_text = str(focus_status.iloc[0].get("Status", "—"))
+            focus_driver = str(focus_status.iloc[0].get("Primary Driver", ""))
+
+        status_color = STATUS_COLORS.get(focus_status_text, C_GRAY)
+        context_bits = [f"{trend_reference_team} reference"]
+        if focus_context:
+            context_bits.append(f"latest {focus_context['date'].strftime('%b %d')}")
+            if pd.notna(focus_context["team_median"]):
+                context_bits.append(f"team n={focus_context['team_n']}")
+        st.markdown(
+            f'<div class="focus-panel" style="border-left:4px solid {status_color};">'
+            f'<div class="focus-name">{display_map.get(focus_player, focus_player)}</div>'
+            f'<div class="focus-meta"><b style="color:{status_color};">{focus_status_text}</b> · '
+            f'{focus_driver} · {" · ".join(context_bits)}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        if focus_context:
+            latest_value = focus_context["value"]
+            team_med = focus_context["team_median"]
+            delta = focus_context["delta_vs_median"]
+            pct = focus_context["percentile"]
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric(f"Latest {trend_title}", format_trend_value(latest_value, trend_unit))
+            with m2:
+                st.metric(
+                    "Team median same day",
+                    format_trend_value(team_med, trend_unit),
+                )
+            with m3:
+                st.metric(
+                    "Vs team median",
+                    format_trend_value(delta, trend_unit, signed=True),
+                )
+            with m4:
+                st.metric(
+                    "Same-day percentile",
+                    f"{pct:.0f}th" if pd.notna(pct) else "—",
+                )
+
+        st.plotly_chart(
+            team_context_trend_figure(
+                bundle,
+                start_date,
+                end_date,
+                trend_reference_team,
+                metric,
+                trend_title,
+                trend_unit,
+                focus_player_key=focus_player,
+                criteria=flag_criteria,
+                show_middle_50=True,
+            ),
+            use_container_width=True,
+            config={"displaylogo": False, "displayModeBar": False, "responsive": True},
+        )
+
+        with st.expander("Compare multiple athletes", expanded=False):
+            st.caption(
+                "Use this only when you actually want direct player-to-player comparison. "
+                "Keeping the selection to roughly 2–6 athletes is the most readable."
+            )
+            all_compare_options = eligible_player_keys(
+                bundle, start_date, end_date, TEAM_ORDER, selected_keys=None
+            )
+            all_compare_options = sorted(all_compare_options, key=lambda k: display_map.get(k, k))
+            roster = bundle.get("roster", pd.DataFrame())
+            roster_team_map = (
+                roster.set_index("player_key")["roster_team"].to_dict()
+                if roster is not None and not roster.empty and "roster_team" in roster.columns
+                else {}
+            )
+            compare_players = st.multiselect(
+                "Athletes to compare",
+                options=all_compare_options,
+                default=[focus_player],
                 format_func=lambda k: (
                     f"{display_map.get(k, k)} · {roster_team_map.get(k, '')}"
                     if roster_team_map.get(k, "") else display_map.get(k, k)
                 ),
-                key=f"trend_team_avg_exclude_clean_{player_seed_key}_v4",
-                placeholder="Select bad-data players",
+                key="trend_compare_players_v5",
+                placeholder="Add athletes",
             )
-
-    outside_seed_count = len(set(trend_players) - set(seeded_players))
-    hidden_seed_count = len(set(seeded_players) - set(trend_players))
-
-    context_parts = []
-    if trend_selected_teams:
-        context_parts.append(" + ".join(trend_selected_teams))
-    else:
-        context_parts.append("Custom player comparison")
-    if outside_seed_count:
-        context_parts.append(f"{outside_seed_count} cross-team added")
-    if hidden_seed_count:
-        context_parts.append(f"{hidden_seed_count} hidden")
-    if team_average_exclude:
-        context_parts.append(f"{len(team_average_exclude)} excluded from team avg")
-
-    has_selected_average = bool(show_selected_average and trend_players)
-    if not trend_players and not show_team_average and not has_selected_average:
-        st.info("Select a team above or choose one or more players to compare.")
-    else:
-        # Keep chart copy deliberately small. The chart itself should be the visual focus.
-        st.markdown(f'<div class="trend-title-clean">{trend_title}</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="trend-context-clean">{" · ".join(context_parts)} · {len(trend_players)} players shown</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.plotly_chart(
-            comparison_trend_figure(
-                bundle,
-                start_date,
-                end_date,
-                trend_players,
-                trend_teams,
-                metric,
-                trend_title,
-                trend_unit,
-                show_team_average=show_team_average,
-                show_selected_average=show_selected_average,
-                team_average_exclude_keys=team_average_exclude,
-                criteria=flag_criteria,
-                restrict_player_teams=restrict_player_teams,
-                legend_mode=legend_mode,
-            ),
-            use_container_width=True,
-            config={
-                "displaylogo": False,
-                "displayModeBar": False,
-                "responsive": True,
-            },
-        )
-
-    if trend_players:
-        comparison_status = build_status_table(
-            bundle, end_date, trend_players, criteria=flag_criteria
-        )
-        if not comparison_status.empty:
-            with st.expander("Selected player status", expanded=False):
-                compact_cols = ["Athlete", "Team", "Pos", "Status", "Primary Driver", "ACWR"]
-                compact = comparison_status[compact_cols].copy()
-                compact["ACWR"] = pd.to_numeric(compact["ACWR"], errors="coerce").round(2)
-                st.dataframe(
-                    compact,
+            if len(compare_players) > 8:
+                st.warning(
+                    "This selection will be visually dense. The focus-athlete view above is better for interpretation; "
+                    "use this chart when the direct overlay itself is the goal."
+                )
+            if compare_players:
+                show_compare_average = st.toggle(
+                    "Show selected-player average",
+                    value=False,
+                    key="trend_compare_average_v5",
+                )
+                st.plotly_chart(
+                    comparison_trend_figure(
+                        bundle,
+                        start_date,
+                        end_date,
+                        compare_players,
+                        [],
+                        metric,
+                        trend_title,
+                        trend_unit,
+                        show_team_average=False,
+                        show_selected_average=show_compare_average,
+                        team_average_exclude_keys=[],
+                        criteria=flag_criteria,
+                        restrict_player_teams=None,
+                        legend_mode="all",
+                    ),
                     use_container_width=True,
-                    hide_index=True,
-                    height=min(420, 38 + 36 * len(compact)),
+                    config={"displaylogo": False, "displayModeBar": False, "responsive": True},
                 )
 
 with summary_tab:
