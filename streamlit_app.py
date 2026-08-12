@@ -17,6 +17,8 @@ import re
 import threading
 import time
 import unicodedata
+import tempfile
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -34,8 +36,8 @@ from urllib3.util.retry import Retry
 import streamlit as st
 import plotly.graph_objects as go
 
-from matplotlib.backends.backend_pdf import PdfPages
-import matplotlib.pyplot as plt
+from gps_report_html import generate_report_html
+from pdf_render import render_html_to_pdf
 
 
 # =============================================================================
@@ -64,8 +66,9 @@ STATSPORTS_SHEET_ID = os.getenv(
 )
 
 STATSPORTS_TAB = os.getenv("STATSPORTS_TAB", str(_secret_value("STATSPORTS_TAB", "Raw Sessions")))
-ROSTER_TAB = os.getenv("ROSTER_TAB", str(_secret_value("ROSTER_TAB", "Master Roster")))
+ROSTER_TAB = "Master Roster"
 PP_SPRINT_TAB = os.getenv("PP_SPRINT_TAB", str(_secret_value("PP_SPRINT_TAB", "PP_Sprint")))
+PP_ACWR_TAB = "PP_ACWR"
 
 # STATSports API credentials belong in Streamlit Secrets / environment variables,
 # never in the public GitHub repository.
@@ -89,7 +92,7 @@ LOCAL_STATSPORTS_XLSX = Path(
 LOCAL_REPORTS_XLSX = Path(
     os.getenv("LOCAL_REPORTS_XLSX", str(SCRIPT_DIR / "Python Reports (10)(3).xlsx"))
 )
-ALLOW_LOCAL_EXCEL_FALLBACK = os.getenv("ALLOW_LOCAL_EXCEL_FALLBACK", "1") != "0"
+ALLOW_LOCAL_EXCEL_FALLBACK = os.getenv("ALLOW_LOCAL_EXCEL_FALLBACK", "0") != "0"
 
 
 # =============================================================================
@@ -238,6 +241,8 @@ _DATA_LOCK = threading.Lock()
 DATA = {
     "raw_practice_source": pd.DataFrame(),
     "raw_practice": pd.DataFrame(),
+    "raw_pp_sprint": pd.DataFrame(),
+    "raw_pp_acwr": pd.DataFrame(),
     "practice_daily": pd.DataFrame(),
     "games_daily": pd.DataFrame(),
     "daily": pd.DataFrame(),
@@ -359,10 +364,24 @@ def _read_google_tab(client, sheet_id: str, tab: str) -> pd.DataFrame:
     return pd.DataFrame(ws.get_all_records())
 
 
+def _read_google_tab_optional(client, sheet_id: str, tab: str) -> pd.DataFrame:
+    try:
+        return _read_google_tab(client, sheet_id, tab)
+    except Exception:
+        return pd.DataFrame()
+
+
 def _read_local_excel(path: Path, sheet_name: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     return pd.read_excel(path, sheet_name=sheet_name)
+
+
+def _read_local_excel_optional(path: Path, sheet_name: str) -> pd.DataFrame:
+    try:
+        return _read_local_excel(path, sheet_name)
+    except Exception:
+        return pd.DataFrame()
 
 
 def load_source_frames():
@@ -377,7 +396,8 @@ def load_source_frames():
         practice = _read_google_tab(client, STATSPORTS_SHEET_ID, STATSPORTS_TAB)
         roster = _read_google_tab(client, PYTHON_REPORTS_SHEET_ID, ROSTER_TAB)
         pp = _read_google_tab(client, PYTHON_REPORTS_SHEET_ID, PP_SPRINT_TAB)
-        return practice, roster, pp, "Google Sheets"
+        pp_acwr = _read_google_tab_optional(client, PYTHON_REPORTS_SHEET_ID, PP_ACWR_TAB)
+        return practice, roster, pp, pp_acwr, "Google Sheets"
     except Exception as exc:
         google_error = exc
 
@@ -386,7 +406,8 @@ def load_source_frames():
             practice = _read_local_excel(LOCAL_STATSPORTS_XLSX, STATSPORTS_TAB)
             roster = _read_local_excel(LOCAL_REPORTS_XLSX, ROSTER_TAB)
             pp = _read_local_excel(LOCAL_REPORTS_XLSX, PP_SPRINT_TAB)
-            return practice, roster, pp, f"Local Excel fallback ({google_error})"
+            pp_acwr = _read_local_excel_optional(LOCAL_REPORTS_XLSX, PP_ACWR_TAB)
+            return practice, roster, pp, pp_acwr, f"Local Excel fallback ({google_error})"
         except Exception as local_exc:
             raise RuntimeError(
                 "Google Sheets load failed and local fallback also failed.\n"
@@ -1253,7 +1274,7 @@ def build_history_calendar(daily: pd.DataFrame, roster: pd.DataFrame) -> pd.Data
 def refresh_data():
     """Reload all sources and rebuild derived data. Returns a human-readable status string."""
     try:
-        practice_raw, roster_raw, pp_raw, source = load_source_frames()
+        practice_raw, roster_raw, pp_raw, pp_acwr_raw, source = load_source_frames()
         roster = clean_roster(roster_raw)
         raw_practice, practice_daily = clean_practice(practice_raw, roster)
         games_daily = add_game_flag_context(clean_games(pp_raw, roster))
@@ -1265,6 +1286,8 @@ def refresh_data():
             DATA.update({
                 "raw_practice_source": practice_raw,
                 "raw_practice": raw_practice,
+                "raw_pp_sprint": pp_raw,
+                "raw_pp_acwr": pp_acwr_raw,
                 "practice_daily": practice_daily,
                 "games_daily": games_daily,
                 "daily": daily,
@@ -2158,196 +2181,235 @@ def team_period_figure(bundle, start_date, end_date, player_keys):
 
 
 # =============================================================================
-# PDF EXPORT
+# REPORT EXPORT — exact supplied standalone report structure
 # =============================================================================
 
-def _pdf_text(ax, x, y, text, size=10, weight="normal", color="#172033", ha="left", va="top"):
-    ax.text(x, y, text, transform=ax.transAxes, fontsize=size, fontweight=weight,
-            color=color, ha=ha, va=va)
+def _report_roster_frame(bundle, team: str) -> pd.DataFrame:
+    """Current roster for one affiliate, sourced only from Python Reports -> Master Roster."""
+    roster = bundle.get("roster", pd.DataFrame()).copy()
+    if roster.empty:
+        return pd.DataFrame(columns=["Athlete", "Team", "Position"])
+    roster = roster[roster["roster_team"].apply(clean_team) == clean_team(team)].copy()
+    if roster.empty:
+        return pd.DataFrame(columns=["Athlete", "Team", "Position"])
+    out = pd.DataFrame({
+        "Athlete": roster["player_name"].fillna("").astype(str).str.strip(),
+        "Team": roster["roster_team"].fillna("").astype(str).str.strip(),
+        "Position": roster["position"].fillna("").astype(str).str.strip(),
+    })
+    out = out[out["Athlete"].ne("")].drop_duplicates(subset=["Athlete"], keep="last")
+    return out.reset_index(drop=True)
 
 
-def _draw_pdf_table(ax, df, cols, max_rows=28):
-    ax.axis("off")
-    if df is None or df.empty:
-        _pdf_text(ax, 0.02, 0.95, "No rows found for the selected filters.", 10, color=C_MUTED)
-        return
-    show = df[cols].head(max_rows).copy()
-    cell_text = []
-    for _, row in show.iterrows():
-        vals = []
-        for c in cols:
-            v = row[c]
-            if c == "ACWR":
-                vals.append("—" if pd.isna(v) else f"{float(v):.2f}")
-            else:
-                vals.append(str(v))
-        cell_text.append(vals)
-    table = ax.table(
-        cellText=cell_text,
-        colLabels=cols,
-        loc="upper left",
-        cellLoc="left",
-        colLoc="left",
-        bbox=[0.0, 0.02, 1.0, 0.95],
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(7.2)
-    for (r, c), cell in table.get_celld().items():
-        if r == 0:
-            cell.set_facecolor(C_NAVY)
-            cell.get_text().set_color("white")
-            cell.get_text().set_fontweight("bold")
+def _report_roster_maps(roster_df: pd.DataFrame):
+    team_map, pos_map, name_map = {}, {}, {}
+    if roster_df is None or roster_df.empty:
+        return team_map, pos_map, name_map
+    for _, row in roster_df.iterrows():
+        key = normalize_name(row.get("Athlete", ""))
+        if not key:
+            continue
+        name_map[key] = str(row.get("Athlete", "")).strip()
+        team_map[key] = str(row.get("Team", "")).strip()
+        pos_map[key] = str(row.get("Position", "")).strip()
+    return team_map, pos_map, name_map
+
+
+def _report_gps_frame(bundle, roster_df: pd.DataFrame) -> pd.DataFrame:
+    """Adapt the dashboard's raw STATSports rows to gps_report_html.py's exact input schema."""
+    raw = bundle.get("raw_practice_source", pd.DataFrame()).copy()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    raw.columns = [str(c).strip() for c in raw.columns]
+    lower = {str(c).strip().casefold(): c for c in raw.columns}
+    rename = {}
+    for src, dst in [("player_name", "Athlete"), ("athlete", "Athlete"), ("date", "Date")]:
+        if src in lower:
+            rename[lower[src]] = dst
+    raw = raw.rename(columns=rename)
+    if "Athlete" not in raw.columns or "Date" not in raw.columns:
+        return pd.DataFrame()
+
+    raw["Athlete"] = raw["Athlete"].fillna("").astype(str).str.strip()
+    raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce").dt.normalize()
+    raw = raw[(raw["Athlete"].ne("")) & raw["Date"].notna()].copy()
+    raw["_player_key"] = raw["Athlete"].apply(normalize_name)
+
+    team_map, pos_map, name_map = _report_roster_maps(roster_df)
+    roster_keys = set(name_map)
+    raw = raw[raw["_player_key"].isin(roster_keys)].copy()
+    if raw.empty:
+        return raw.drop(columns=["_player_key"], errors="ignore")
+
+    # Master Roster is authoritative for REPORT MEMBERSHIP and current display name.
+    # For the supplied flag engine, preserve the GPS session's own team when it
+    # exists (or derive it from session_name); this keeps historical same-team
+    # rolling baselines from being rewritten after a promotion/demotion.
+    raw["Athlete"] = raw["_player_key"].map(name_map).fillna(raw["Athlete"])
+    raw_team = pd.Series("", index=raw.index, dtype=object)
+    for candidate in ["Team", "team", "practice_team"]:
+        if candidate in raw.columns:
+            vals = raw[candidate].fillna("").astype(str).map(clean_team)
+            raw_team = raw_team.where(raw_team.ne(""), vals)
+    if "session_name" in raw.columns:
+        session_team = raw["session_name"].fillna("").astype(str).map(parse_team_from_session)
+        raw_team = raw_team.where(raw_team.ne(""), session_team)
+    raw["Team"] = raw_team.where(raw_team.ne(""), raw["_player_key"].map(team_map)).fillna("")
+
+    raw_pos = pd.Series("", index=raw.index, dtype=object)
+    for candidate in ["Position", "position"]:
+        if candidate in raw.columns:
+            vals = raw[candidate].fillna("").astype(str).str.strip()
+            raw_pos = raw_pos.where(raw_pos.ne(""), vals)
+    raw["Position"] = raw_pos.where(raw_pos.ne(""), raw["_player_key"].map(pos_map)).fillna("")
+
+    for col in ["top_speed_ms", "n_sprints", "sprint_distance_m", "n_accelerations",
+                "hsr_distance_m", "total_distance_m", "duration_min"]:
+        if col not in raw.columns:
+            raw[col] = np.nan
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    for col in ["drill_name", "session_name", "week", "week_start"]:
+        if col not in raw.columns:
+            raw[col] = ""
+        raw[col] = raw[col].fillna("").astype(str).str.strip()
+
+    return raw.drop(columns=["_player_key"], errors="ignore")
+
+
+def _report_game_frame(bundle, roster_df: pd.DataFrame) -> pd.DataFrame:
+    raw = bundle.get("raw_pp_sprint", pd.DataFrame()).copy()
+    if raw is None or raw.empty:
+        # Fallback to the already-cleaned daily game frame if raw PP_Sprint is unavailable.
+        gd = bundle.get("games_daily", pd.DataFrame()).copy()
+        if gd is None or gd.empty:
+            return pd.DataFrame()
+        raw = pd.DataFrame({
+            "batter": gd.get("player_name", ""),
+            "game_date": gd.get("date"),
+            "max_effort_runs": gd.get("game_max_effort_runs", 0),
+            "max_effort_distance_covered_yards": gd.get("game_max_effort_distance_yards", 0),
+            "distance_covered_yards": gd.get("game_distance_yards", 0),
+        })
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    lower = {str(c).strip().casefold(): c for c in raw.columns}
+    if "batter" not in lower:
+        if "player_name" in lower:
+            raw = raw.rename(columns={lower["player_name"]: "batter"})
         else:
-            cell.set_facecolor("#FFFFFF" if r % 2 else "#F7F9FC")
-        cell.set_edgecolor(C_BORDER)
-        cell.set_linewidth(0.5)
+            return pd.DataFrame()
+    elif lower["batter"] != "batter":
+        raw = raw.rename(columns={lower["batter"]: "batter"})
+    lower = {str(c).strip().casefold(): c for c in raw.columns}
+    if "game_date" not in lower:
+        if "date" in lower:
+            raw = raw.rename(columns={lower["date"]: "game_date"})
+        else:
+            return pd.DataFrame()
+    elif lower["game_date"] != "game_date":
+        raw = raw.rename(columns={lower["game_date"]: "game_date"})
+
+    raw["batter"] = raw["batter"].fillna("").astype(str).str.strip()
+    raw["game_date"] = pd.to_datetime(raw["game_date"], errors="coerce").dt.normalize()
+    raw = raw[(raw["batter"].ne("")) & raw["game_date"].notna()].copy()
+    raw["_player_key"] = raw["batter"].apply(normalize_name)
+    _, _, name_map = _report_roster_maps(roster_df)
+    raw = raw[raw["_player_key"].isin(set(name_map))].copy()
+    raw["batter"] = raw["_player_key"].map(name_map).fillna(raw["batter"])
+
+    for col in ["max_effort_runs", "max_effort_distance_covered_yards", "distance_covered_yards",
+                "monthly_p95_sprint_speed"]:
+        if col not in raw.columns:
+            raw[col] = np.nan
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    return raw.drop(columns=["_player_key"], errors="ignore")
 
 
-def make_pdf_bytes(bundle, start_date, end_date, teams, player_keys, criteria=None) -> bytes:
-    start = pd.Timestamp(start_date).normalize()
-    end = pd.Timestamp(end_date).normalize()
-    criteria = {**DEFAULT_FLAG_CRITERIA, **(criteria or {})}
-    status = build_status_table(bundle, end, player_keys, criteria=criteria)
-    period = build_period_summary(bundle, start, end, player_keys)
-    history = selected_history(bundle, start, end, player_keys)
-
-    output = io.BytesIO()
-    with PdfPages(output) as pdf:
-        # ------------------------------------------------------------------
-        # Cover / summary
-        # ------------------------------------------------------------------
-        fig = plt.figure(figsize=(11, 8.5))
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.axis("off")
-        ax.add_patch(plt.Rectangle((0, 0.90), 1, 0.10, transform=ax.transAxes, color=C_NAVY))
-        ax.add_patch(plt.Rectangle((0, 0.90), 0.012, 0.10, transform=ax.transAxes, color=C_RED))
-        _pdf_text(ax, 0.04, 0.965, "GPS WORKLOAD REPORT", 20, "bold", "white", va="center")
-        _pdf_text(ax, 0.04, 0.925, "Washington Nationals — Player Development S&C", 9, color="white", va="center")
-
-        team_text = ", ".join(teams) if teams else "All Teams"
-        _pdf_text(ax, 0.04, 0.855, f"Selected period: {start.strftime('%b %d, %Y')} — {end.strftime('%b %d, %Y')}", 12, "bold", C_TEXT)
-        _pdf_text(ax, 0.04, 0.825, f"Teams: {team_text}", 9, color=C_MUTED)
-        _pdf_text(ax, 0.04, 0.800, f"Athletes: {len(player_keys)}", 9, color=C_MUTED)
-        _pdf_text(ax, 0.04, 0.775, "Status snapshot is calculated as of the selected end date.", 8, color=C_MUTED)
-        active_rules = []
-        if criteria["use_acwr"]:
-            active_rules.append(f'Game EWMA ACWR Monitor≥{criteria["monitor_acwr"]:.2f} / Review≥{criteria["review_acwr"]:.2f}')
-        if criteria["use_gps_flags"]:
-            active_rules.append(
-                f'GPS Team+Position z Monitor≥{criteria["monitor_z"]:.1f} / Review≥{criteria["review_z"]:.1f}; '
-                f'{criteria["rolling_window_days"]}d rolling Sprints/Accels'
-            )
-        if criteria["use_combined_load"]:
-            active_rules.append('Combined practice+game load')
-        if criteria["use_exposure_flags"]:
-            active_rules.append(
-                f'Sprint gap>{criteria["max_days_without_sprint"]}d / HSR gap>{criteria["max_days_without_hsr"]}d; '
-                f'7d sprint<{criteria["low_7d_sprint_dist_m"]:.0f}m / HSR<{criteria["low_7d_hsr_m"]:.0f}m'
-            )
-        criteria_text = " · ".join(active_rules) if active_rules else "No optional flag rules enabled"
-        _pdf_text(ax, 0.04, 0.750, f"Active criteria: {criteria_text}", 7, color=C_MUTED)
-
-        counts = status["Status"].value_counts() if not status.empty else pd.Series(dtype=int)
-        card_names = ["Review", "Monitor", "Needs Exposure", "Prepared", "Data Check"]
-        x0, y0, w, h, gap = 0.04, 0.66, 0.17, 0.09, 0.018
-        for i, name in enumerate(card_names):
-            x = x0 + i * (w + gap)
-            ax.add_patch(plt.Rectangle((x, y0), w, h, transform=ax.transAxes,
-                                       facecolor="#FFFFFF", edgecolor=C_BORDER, linewidth=1))
-            _pdf_text(ax, x + 0.012, y0 + 0.068, name.upper(), 7.5, "bold", C_MUTED)
-            _pdf_text(ax, x + 0.012, y0 + 0.045, str(int(counts.get(name, 0))), 18, "bold", STATUS_COLORS[name])
-
-        total_distance = period["Total_Distance_m"].sum() if not period.empty else 0
-        total_hsr = period["HSR_m"].sum() if not period.empty else 0
-        total_acc = period["Accelerations"].sum() if not period.empty else 0
-        total_sprints = period["Sprints"].sum() if not period.empty else 0
-        _pdf_text(ax, 0.04, 0.60, "SELECTED-PERIOD TOTALS", 8, "bold", C_MUTED)
-        metrics = [
-            ("Distance", f"{total_distance:,.0f} m"),
-            ("HSR", f"{total_hsr:,.0f} m"),
-            ("Accelerations", f"{total_acc:,.0f}"),
-            ("Sprints", f"{total_sprints:,.0f}"),
-        ]
-        for i, (label, value) in enumerate(metrics):
-            x = 0.04 + i * 0.23
-            _pdf_text(ax, x, 0.555, value, 16, "bold", C_NAVY)
-            _pdf_text(ax, x, 0.525, label, 8, color=C_MUTED)
-
-        table_ax = fig.add_axes([0.04, 0.06, 0.92, 0.42])
-        _draw_pdf_table(
-            table_ax,
-            status,
-            ["Athlete", "Pos", "Status", "Primary Driver", "Combined Load", "ACWR", "Last Game Load", "Last Sprint"],
-            max_rows=24,
-        )
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        # Additional status table pages if needed.
-        if len(status) > 24:
-            for start_row in range(24, len(status), 30):
-                fig = plt.figure(figsize=(11, 8.5))
-                ax = fig.add_axes([0.05, 0.06, 0.90, 0.88])
-                _pdf_text(ax, 0.0, 1.02, "Status Snapshot — Continued", 15, "bold", C_NAVY)
-                _draw_pdf_table(
-                    ax,
-                    status.iloc[start_row:start_row + 30],
-                    ["Athlete", "Pos", "Status", "Primary Driver", "Combined Load", "ACWR", "Last Game Load", "Last Sprint"],
-                    max_rows=30,
-                )
-                pdf.savefig(fig, bbox_inches="tight")
-                plt.close(fig)
-
-        # ------------------------------------------------------------------
-        # One page per athlete
-        # ------------------------------------------------------------------
-        display = player_display_map(bundle)
-        status_by_key = status.set_index("Player Key").to_dict("index") if not status.empty else {}
-
-        for key in player_keys:
-            p = history[history["player_key"] == key].sort_values("date").copy()
-            row = status_by_key.get(key, {})
-            name = row.get("Athlete", display.get(key, key))
-            team = row.get("Team", "")
-            pos = row.get("Pos", "")
-            status_name = row.get("Status", "Data Check")
-            driver = row.get("Primary Driver", "")
-            acwr = row.get("ACWR", np.nan)
-
-            fig, axes = plt.subplots(4, 2, figsize=(11, 8.5))
-            fig.subplots_adjust(top=0.82, left=0.08, right=0.97, hspace=0.62, wspace=0.24)
-            fig.text(0.06, 0.965, f"{name.upper()} — GPS TRENDS", fontsize=17, fontweight="bold", color=C_NAVY, va="top")
-            fig.text(0.06, 0.932, f"{team} · {pos} · {start.strftime('%b %d')}–{end.strftime('%b %d, %Y')}", fontsize=9, color=C_MUTED, va="top")
-            acwr_text = "—" if pd.isna(acwr) else f"{float(acwr):.2f}"
-            fig.text(0.06, 0.902, f"ACWR: {acwr_text}   ·   {driver}", fontsize=9, color=C_TEXT, va="top")
-            fig.text(0.94, 0.932, status_name.upper(), fontsize=10, fontweight="bold", color=STATUS_COLORS.get(status_name, C_GRAY), ha="right", va="top")
-
-            for ax, (metric, title, unit, _) in zip(axes.flat, TREND_METRICS):
-                ax.set_title(title, loc="left", fontsize=9, fontweight="bold", color=C_NAVY)
-                if p.empty or metric not in p.columns or safe_num(p[metric]).dropna().empty:
-                    ax.text(0.5, 0.5, "No data", ha="center", va="center", color=C_MUTED, transform=ax.transAxes)
-                    ax.set_axis_off()
-                    continue
-                y = safe_num(p[metric])
-                ax.plot(p["date"], y, linewidth=1.6, marker="o", markersize=2.8, color=C_NAVY)
-                if metric == "acwr":
-                    ax.axhline(criteria["optimal_low_acwr"], linestyle="--", linewidth=0.8, color=C_BLUE)
-                    if criteria["use_acwr"]:
-                        ax.axhline(criteria["monitor_acwr"], linestyle="--", linewidth=0.8, color=C_AMBER)
-                        ax.axhline(criteria["review_acwr"], linestyle="--", linewidth=0.8, color=C_RED)
-                ax.grid(axis="y", alpha=0.18)
-                ax.tick_params(labelsize=6)
-                for spine in ["top", "right"]:
-                    ax.spines[spine].set_visible(False)
-                ax.set_ylabel(unit, fontsize=6, color=C_MUTED)
-
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
-
-    output.seek(0)
-    return output.getvalue()
+def _report_acwr_frame(bundle, roster_df: pd.DataFrame) -> pd.DataFrame:
+    raw = bundle.get("raw_pp_acwr", pd.DataFrame()).copy()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    raw.columns = [str(c).strip().casefold() for c in raw.columns]
+    if "batter" not in raw.columns or "ewma_acwr_7_28" not in raw.columns:
+        return pd.DataFrame()
+    raw["_player_key"] = raw["batter"].fillna("").astype(str).apply(normalize_name)
+    _, _, name_map = _report_roster_maps(roster_df)
+    raw = raw[raw["_player_key"].isin(set(name_map))].copy()
+    raw["batter"] = raw["_player_key"].map(name_map).fillna(raw["batter"])
+    raw["ewma_acwr_7_28"] = pd.to_numeric(raw["ewma_acwr_7_28"], errors="coerce")
+    if "date" in raw.columns:
+        raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
+    return raw.drop(columns=["_player_key"], errors="ignore")
 
 
+def build_exact_team_report(bundle, team: str, report_date, temp_dir: Path) -> dict:
+    """Generate one team's report with the supplied gps_report_html.py structure."""
+    team = clean_team(team)
+    roster_df = _report_roster_frame(bundle, team)
+    if roster_df.empty:
+        raise RuntimeError(f"No current Master Roster athletes found for {team}.")
+
+    df_gps = _report_gps_frame(bundle, roster_df)
+    df_game = _report_game_frame(bundle, roster_df)
+    df_acwr = _report_acwr_frame(bundle, roster_df)
+    report_ts = pd.Timestamp(report_date).normalize()
+
+    html = generate_report_html(df_gps, df_game, df_acwr, roster_df, team, report_ts)
+    safe_team = re.sub(r"[^A-Za-z0-9_-]+", "_", team).strip("_") or "Team"
+    stem = f"{safe_team}_GPS_Workload_{report_ts.strftime('%Y-%m-%d')}"
+    html_path = temp_dir / f"{stem}.html"
+    pdf_path = temp_dir / f"{stem}.pdf"
+    html_path.write_text(html, encoding="utf-8")
+
+    pdf_ok = render_html_to_pdf(html_path, pdf_path)
+    return {
+        "team": team,
+        "html_name": html_path.name,
+        "html_bytes": html_path.read_bytes(),
+        "pdf_name": pdf_path.name if pdf_ok and pdf_path.exists() else None,
+        "pdf_bytes": pdf_path.read_bytes() if pdf_ok and pdf_path.exists() else None,
+    }
+
+
+def build_exact_reports(bundle, teams, report_date) -> dict:
+    """One standalone-style report per team. Multi-team selections return a ZIP of those reports."""
+    report_teams = ordered_teams(teams or [])
+    if not report_teams:
+        raise RuntimeError("Select at least one team to build reports.")
+
+    results, errors = [], []
+    with tempfile.TemporaryDirectory(prefix="gps_reports_") as td:
+        temp_dir = Path(td)
+        for team in report_teams:
+            try:
+                results.append(build_exact_team_report(bundle, team, report_date, temp_dir))
+            except Exception as exc:
+                errors.append(f"{team}: {exc}")
+
+        if not results:
+            raise RuntimeError("No reports were generated. " + " | ".join(errors))
+
+        if len(results) == 1:
+            result = results[0]
+            return {"mode": "single", "result": result, "errors": errors}
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for result in results:
+                if result["pdf_bytes"] is not None:
+                    zf.writestr(result["pdf_name"], result["pdf_bytes"])
+                else:
+                    zf.writestr(result["html_name"], result["html_bytes"])
+            if errors:
+                zf.writestr("report_errors.txt", "\n".join(errors))
+        return {
+            "mode": "zip",
+            "zip_bytes": zip_buffer.getvalue(),
+            "zip_name": f"GPS_Workload_Reports_{pd.Timestamp(report_date).strftime('%Y-%m-%d')}.zip",
+            "results": results,
+            "errors": errors,
+        }
 
 
 # =============================================================================
@@ -2483,8 +2545,8 @@ def _perform_api_sync(start_value, end_value):
     st.session_state["api_sync_notice"] = ("success" if success else "error", message)
     if success:
         st.cache_data.clear()
-        st.session_state.pop("pdf_bytes", None)
-        st.session_state.pop("pdf_signature", None)
+        st.session_state.pop("exact_report_artifacts", None)
+        st.session_state.pop("report_signature", None)
         st.rerun()
     else:
         st.error(message)
@@ -2502,8 +2564,8 @@ with st.sidebar:
     st.header("Filters")
     if st.button("Refresh Google Sheets", use_container_width=True):
         st.cache_data.clear()
-        st.session_state.pop("pdf_bytes", None)
-        st.session_state.pop("pdf_signature", None)
+        st.session_state.pop("exact_report_artifacts", None)
+        st.session_state.pop("report_signature", None)
         st.rerun()
 
 try:
@@ -2762,43 +2824,70 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Invalidate an old PDF when the selection changes.
-pdf_signature = (
-    str(start_date),
+# Reports use the supplied standalone structure: one team, one report date,
+# full current Master Roster. Dashboard player/date-range filters do not alter
+# the report roster or page structure; the selected END date is the report date.
+report_signature = (
     str(end_date),
     tuple(sorted(teams or [])),
-    tuple(sorted(keys)),
-    tuple(sorted(flag_criteria.items())),
+    bundle.get("loaded_at"),
 )
-if st.session_state.get("pdf_signature") != pdf_signature:
-    st.session_state.pop("pdf_bytes", None)
-    st.session_state["pdf_signature"] = pdf_signature
+if st.session_state.get("report_signature") != report_signature:
+    st.session_state.pop("exact_report_artifacts", None)
+    st.session_state["report_signature"] = report_signature
 
-pdf_col, note_col = st.columns([1, 3])
-with pdf_col:
-    if st.button("Build PDF for selection", type="primary", use_container_width=True):
-        with st.spinner("Building PDF…"):
-            st.session_state["pdf_bytes"] = make_pdf_bytes(
-                bundle, start_date, end_date, teams or [], keys, criteria=flag_criteria
-            )
+report_col, note_col = st.columns([1, 3])
+with report_col:
+    if st.button("Build team report(s)", type="primary", use_container_width=True):
+        with st.spinner("Building original-format report(s)…"):
+            try:
+                st.session_state["exact_report_artifacts"] = build_exact_reports(
+                    bundle, teams or [], end_date
+                )
+            except Exception as exc:
+                st.session_state.pop("exact_report_artifacts", None)
+                st.error(f"Report build failed: {exc}")
 with note_col:
     st.caption(
-        "The PDF uses the selected teams, players, and date range. "
-        "It includes the end-of-period status snapshot plus one trend page per athlete."
+        "Reports match the supplied standalone GPS reporting structure: one affiliate per report, "
+        "the full current Python Reports → Master Roster for that affiliate, Daily Snapshot, then "
+        "one GPS trend page per position player. The selected end date is used as the report date. "
+        "Report flags use the fixed supplied gps_flags.py rules; dashboard slider changes do not rewrite the official report logic."
     )
 
-if st.session_state.get("pdf_bytes"):
-    filename = (
-        f"GPS_Workload_Report_{pd.Timestamp(start_date).strftime('%Y%m%d')}_to_"
-        f"{pd.Timestamp(end_date).strftime('%Y%m%d')}.pdf"
-    )
-    st.download_button(
-        "Download PDF",
-        data=st.session_state["pdf_bytes"],
-        file_name=filename,
-        mime="application/pdf",
-        use_container_width=False,
-    )
+artifacts = st.session_state.get("exact_report_artifacts")
+if artifacts:
+    if artifacts.get("errors"):
+        st.warning("Some team reports failed: " + " | ".join(artifacts["errors"]))
+    if artifacts["mode"] == "single":
+        result = artifacts["result"]
+        dl_pdf, dl_html = st.columns(2)
+        with dl_pdf:
+            if result["pdf_bytes"] is not None:
+                st.download_button(
+                    "Download report PDF",
+                    data=result["pdf_bytes"],
+                    file_name=result["pdf_name"],
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("Chromium PDF rendering was unavailable; use the HTML report's Print / PDF button.")
+        with dl_html:
+            st.download_button(
+                "Download report HTML",
+                data=result["html_bytes"],
+                file_name=result["html_name"],
+                mime="text/html",
+                use_container_width=True,
+            )
+    else:
+        st.download_button(
+            "Download team reports ZIP",
+            data=artifacts["zip_bytes"],
+            file_name=artifacts["zip_name"],
+            mime="application/zip",
+        )
 
 if not keys:
     st.warning("No players match the selected filters.")
