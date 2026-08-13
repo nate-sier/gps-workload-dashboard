@@ -3710,3 +3710,4 @@ st.caption(
     "Active flagging criteria: "
     + (" · ".join(active_criteria_parts) if active_criteria_parts else "No optional flag criteria enabled.")
 )
+
